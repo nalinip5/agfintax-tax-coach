@@ -1,0 +1,4 @@
+# Only needed when DATABASE_URL points at real Postgres (see docker-compose.yml).
+# Not required for local SQLite dev.
+psycopg2-binary==2.9.9
+pgvector==0.3.4
