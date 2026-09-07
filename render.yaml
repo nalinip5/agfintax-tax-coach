@@ -1,3 +1,4 @@
+
 databases:
   - name: agfintax-db
     plan: free
@@ -13,6 +14,8 @@ services:
     buildCommand: pip install -r requirements.txt -r requirements-postgres.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.10"
       - key: DATABASE_URL
         fromDatabase:
           name: agfintax-db
