@@ -18,10 +18,12 @@ services:
           name: agfintax-db
           property: connectionString
       - key: LLM_PROVIDER
-        value: anthropic
+        value: openai
       - key: LLM_MODEL
-        value: claude-sonnet-4-6
+        value: gpt-4o-mini
       - key: ANTHROPIC_API_KEY
+        sync: false   # optional -- only needed if LLM_PROVIDER=anthropic
+      - key: OPENAI_API_KEY
         sync: false   # set this in the Render dashboard; leave blank to run in deterministic-fallback mode
       - key: DAILY_MESSAGE_LIMIT_DEFAULT
         value: "50"
