@@ -56,6 +56,9 @@ def _call_openai(system: str, prompt: str, model: str, max_tokens: int) -> str:
 _PROVIDERS = {
     "anthropic": _call_anthropic,
     "openai": _call_openai,
+    # "azure_openai": _call_azure_openai,   # add future providers here, then flip
+    #                                          LLM_PROVIDER in .env -- no
+    #                                          agent/router code changes.
 }
 
 

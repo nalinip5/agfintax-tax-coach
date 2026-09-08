@@ -38,6 +38,8 @@ export const api = {
 
   usage: (user_id: string) => fetch(`${BASE}/usage/${user_id}`).then(json<{ tier: string; used_today: number; limit: number }>),
 
+  suggestions: (user_id: string) => fetch(`${BASE}/suggestions/${user_id}`).then(json<{ suggestions: string[] }>),
+
   listSources: () => fetch(`${BASE}/kb/sources`).then(json<Source[]>),
 
   createSource: (body: Omit<Source, 'id'>) =>

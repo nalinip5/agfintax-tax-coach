@@ -12,13 +12,6 @@ type Message = {
 const USER_ID = 'demo-user'
 
 const INTENT_LABEL: Record<string, string> = {
-  TAX_RULE: 'Tax rule',
-  PLAN_QUESTION: 'Your plan',
-  STRATEGY_EXPLANATION: 'Strategy',
-  WHAT_IF: 'Scenario',
-  LIFE_EVENT: 'Life event',
-  PROFESSIONAL_JUDGMENT: 'Professional judgment',
-  DOCUMENTATION: 'Documentation',
   OUT_OF_SCOPE: 'Out of scope',
   PII_VIOLATION: 'Blocked',
 }
@@ -42,12 +35,15 @@ function LifeEventCard() {
     <div className="rounded-lg border border-clay-500/40 bg-clay-500/5 px-4 py-3 text-sm text-ledger-900">
       <p className="font-medium text-clay-600">Worth a second look</p>
       <p className="mt-0.5 text-ledger-700">
-        This touches a life event that can shift your filing situation. We've flagged it for a
-        professional referral so nothing gets missed.
+        This touches a life event that can shift your filing situation. Talk to our AGFinTax Tax
+        Planner to update your plan.
       </p>
     </div>
   )
 }
+// Kept for potential future use when the agent's create_professional_referral tool fires;
+// not currently wired to a specific displayable signal from the single-agent response.
+void LifeEventCard;
 
 export default function ChatView() {
   const [messages, setMessages] = useState<Message[]>([
@@ -59,12 +55,17 @@ export default function ChatView() {
   const [input, setInput] = useState('')
   const [conversationId, setConversationId] = useState<string>()
   const [usage, setUsage] = useState<{ used_today: number; limit: number; tier: string }>()
+  const [suggestions, setSuggestions] = useState<string[]>([])
   const [sending, setSending] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     api.usage(USER_ID).then(setUsage).catch(() => {})
   }, [messages.length])
+
+  useEffect(() => {
+    api.suggestions(USER_ID).then((r) => setSuggestions(r.suggestions)).catch(() => {})
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -124,11 +125,7 @@ export default function ChatView() {
         <div className="rounded-xl border border-ledger-200 bg-white p-4">
           <h2 className="font-serif text-lg text-ledger-900">Try asking</h2>
           <ul className="mt-2 space-y-2 text-sm text-ledger-700">
-            {[
-              'What is the 401k contribution limit?',
-              'What if I earn $90,000 next year?',
-              "I'm getting married next month",
-            ].map((s) => (
+            {(suggestions.length > 0 ? suggestions : ['What is on my plan?']).map((s) => (
               <li key={s}>
                 <button
                   onClick={() => setInput(s)}
@@ -162,14 +159,13 @@ export default function ChatView() {
                         }`
                   }
                 >
-                  {m.intent && m.role === 'assistant' && (
+                  {m.intent && m.role === 'assistant' && m.intent !== 'AGENT' && (
                     <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-ledger-500">
                       {INTENT_LABEL[m.intent] ?? m.intent}
                     </span>
                   )}
                   {m.content}
                 </div>
-                {m.intent === 'LIFE_EVENT' && <LifeEventCard />}
                 {m.citations && m.citations.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {m.citations.map((c, j) => (

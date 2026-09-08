@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -14,7 +14,9 @@ _TIER_LIMITS = {
 
 
 def _today() -> str:
-    return date.today().isoformat()
+    """PRD Section 3: usage limits reset at midnight UTC -- must use UTC
+    explicitly, not the server's local timezone."""
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def check_and_increment(db: Session, user_id: str, tier: str) -> tuple[bool, int, int]:

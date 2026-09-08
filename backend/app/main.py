@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.db import Base, engine
-from app.routers import chat, plan, kb, usage, health
+from app.routers import chat, plan, kb, usage, health, documents
 
 settings = get_settings()
 
@@ -25,3 +25,4 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(plan.router, prefix="/api")
 app.include_router(kb.router, prefix="/api")
 app.include_router(usage.router, prefix="/api")
+app.include_router(documents.router, prefix="/api")

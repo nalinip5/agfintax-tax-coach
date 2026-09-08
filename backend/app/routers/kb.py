@@ -4,9 +4,22 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import Document, SourceRegistry
 from app.schemas import SourceRegistryIn, SourceRegistryOut
-from app.tools.knowledge import ingest_document, reindex
+from app.tools.knowledge import APPROVED_SOURCE_DOMAINS, ingest_document, reindex
 
 router = APIRouter()
+
+
+def _enforce_domain_policy(domain: str) -> None:
+    """PRD Section 5: only these 7 domains may ever be used, regardless of
+    what's inserted into source_registry -- reject at write time too, not
+    just at query time, so the registry can never even contain something
+    the retrieval layer would otherwise have to silently ignore."""
+    if domain not in APPROVED_SOURCE_DOMAINS:
+        raise HTTPException(
+            422,
+            f"'{domain}' is not on the approved source list ({sorted(APPROVED_SOURCE_DOMAINS)}). "
+            "Tax Coach may not retrieve from any other domain under any circumstance.",
+        )
 
 
 # --- Internal documents (admin-uploaded knowledge) ---
@@ -53,6 +66,7 @@ def list_sources(db: Session = Depends(get_db)):
 
 @router.post("/kb/sources", response_model=SourceRegistryOut)
 def create_source(body: SourceRegistryIn, db: Session = Depends(get_db)):
+    _enforce_domain_policy(body.domain)
     row = SourceRegistry(**body.model_dump())
     db.add(row)
     db.commit()
@@ -62,6 +76,7 @@ def create_source(body: SourceRegistryIn, db: Session = Depends(get_db)):
 
 @router.patch("/kb/sources/{source_id}", response_model=SourceRegistryOut)
 def update_source(source_id: str, body: SourceRegistryIn, db: Session = Depends(get_db)):
+    _enforce_domain_policy(body.domain)
     row = db.query(SourceRegistry).filter(SourceRegistry.id == source_id).first()
     if not row:
         raise HTTPException(404, "Source not found")

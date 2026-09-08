@@ -50,6 +50,17 @@ class TaxPlan(Base):
     tax_year = Column(Integer, nullable=False)
     filing_status = Column(String, nullable=False, default="single")
     data = Column(JSON, default=dict)  # income, deductions, accounts, etc.
+
+    # --- Plan-aware fields (PRD 4.1) -- Tax Coach must always have these
+    # without the user re-explaining their situation. ---
+    agi = Column(Float, nullable=True)
+    magi = Column(Float, nullable=True)
+    marginal_rate = Column(Float, nullable=True)
+    confirmed_savings = Column(Float, default=0)
+    potential_savings = Column(Float, default=0)
+    urgent_observations = Column(JSON, default=list)  # e.g. ["Q4 estimated payment due Jan 15"]
+    missing_questionnaire_items = Column(JSON, default=list)  # items affecting savings calcs
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -63,6 +74,8 @@ class Strategy(Base):
     tax_plan_id = Column(String, ForeignKey("tax_plans.id"), nullable=False)
     title = Column(String, nullable=False)
     description = Column(Text, nullable=False)
+    why_it_applies = Column(Text, nullable=True)  # PRD 4.1 -- personalized rationale
+    status = Column(String, default="potential")  # "confirmed" | "potential"
     estimated_savings = Column(Float, nullable=True)
     citations = Column(JSON, default=list)
     created_at = Column(DateTime, default=datetime.utcnow)

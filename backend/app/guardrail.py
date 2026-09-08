@@ -13,7 +13,7 @@ _PATTERNS = {
     "ssn": re.compile(r"\b\d{3}-?\d{2}-?\d{4}\b"),
     "credit_card": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
     "dob": re.compile(r"\b(0[1-9]|1[0-2])[/\-](0[1-9]|[12]\d|3[01])[/\-](19|20)\d{2}\b"),
-    "account_number": re.compile(r"\b(?:account|acct)\s*#?\s*\d{6,}\b", re.IGNORECASE),
+    "account_number": re.compile(r"\b(?:account|acct)\s*#?\s*[:\-]?\s*\d{6,}\b", re.IGNORECASE),
     "password": re.compile(r"\bpassword\s*[:=]\s*\S+", re.IGNORECASE),
 }
 
