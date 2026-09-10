@@ -11,3 +11,5 @@ python-multipart==0.0.9
 openai==1.51.0
 PyJWT[crypto]==2.9.0
 beautifulsoup4==4.12.3
+mcp<2
+anyio>=4.0,<5

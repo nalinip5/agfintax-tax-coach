@@ -40,27 +40,48 @@ APPROVED_SOURCE_DOMAINS = frozenset({
 })
 
 
+_STOPWORDS = {
+    "the", "and", "for", "that", "this", "what", "are", "does", "with", "from", "your",
+    "you", "have", "will", "can", "how", "who", "why", "when", "which", "about", "into",
+    "strategy", "strategies", "tell", "know", "want", "need", "get", "any", "some",
+}
+
+
 def search_internal_knowledge(db: Session, query: str, limit: int = 5) -> list[dict]:
     """Keyword OR-match across query terms, ranked by number of terms hit.
     Suitable for SQLite/dev. On Postgres, swap for a pgvector similarity
-    search / tsvector full-text query -- callers don't need to change."""
-    terms = [t for t in query.split() if len(t) > 2]
-    if not terms:
+    search / tsvector full-text query -- callers don't need to change.
+
+    Requires a meaningful fraction of SIGNIFICANT (non-stopword) query
+    terms to actually match -- a document must not be presented as
+    relevant just because it happens to share a few common words with the
+    question. Every fact-bearing reply must trace to genuinely relevant
+    source content, not a coincidental keyword collision.
+    """
+    all_terms = [t for t in query.split() if len(t) > 2]
+    significant_terms = [t for t in all_terms if t.lower() not in _STOPWORDS]
+    if not significant_terms:
         return []
 
     rows = (
         db.query(DocumentChunk)
         .join(Document)
         .filter(Document.published.is_(True))
-        .filter(sa_or(*[DocumentChunk.content.ilike(f"%{t}%") for t in terms]))
+        .filter(sa_or(*[DocumentChunk.content.ilike(f"%{t}%") for t in significant_terms]))
         .all()
     )
 
-    def score(chunk: DocumentChunk) -> int:
+    def score(chunk: DocumentChunk) -> float:
         text = chunk.content.lower()
-        return sum(1 for t in terms if t.lower() in text)
+        return sum(1 for t in significant_terms if t.lower() in text) / len(significant_terms)
 
-    ranked = sorted(rows, key=score, reverse=True)[:limit]
+    # Require at least half of the significant query terms to genuinely
+    # appear in the chunk -- filters out documents that only coincidentally
+    # share one unrelated word with the question.
+    scored = [(c, score(c)) for c in rows]
+    relevant = [(c, s) for c, s in scored if s >= 0.5]
+    ranked = sorted(relevant, key=lambda cs: cs[1], reverse=True)[:limit]
+    ranked = [c for c, _ in ranked]
     return [
         {"document_id": r.document_id, "content": r.content, "source_domain": r.document.source_domain}
         for r in ranked

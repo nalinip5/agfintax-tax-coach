@@ -22,19 +22,22 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None), db:
     # --- Guardrail Layer (PRD 4.8): PII never reaches the agent ---
     guardrail_result = check_pii(req.message)
     if guardrail_result.blocked:
+        # Only the MASKED preview is ever logged -- never the raw value.
         log_event(
             db,
             "pii_blocked",
             user_id=user_id,
             conversation_id=req.conversation_id,
-            payload={"categories": guardrail_result.matched_categories},
+            payload={"categories": guardrail_result.matched_categories, "masked": guardrail_result.masked_matches},
+        )
+        detected = ", ".join(
+            f"{cat.replace('_', ' ')} ({masked})" for cat, masked in guardrail_result.masked_matches.items()
         )
         return ChatResponse(
             conversation_id=req.conversation_id or "",
             intent="PII_VIOLATION",
             reply=(
-                "For your safety, that message wasn't sent -- it appears to contain sensitive personal "
-                "information (like a Social Security number, credit card number, or date of birth). "
+                f"For your safety, that message wasn't sent. Detected: {detected}. "
                 "Please remove that and try again."
             ),
             blocked=True,

@@ -25,7 +25,8 @@ import re
 
 from sqlalchemy.orm import Session
 
-from app.tools.knowledge import search_internal_knowledge, search_official_sources
+from app.tools.knowledge import search_internal_knowledge, search_official_sources  # noqa: F401 -- kept for the deterministic fallback path below
+from app.mcp_bridge import mcp_turn
 from app.tools.tax_calc import calculate_tax_scenario, get_tax_constant
 from app.tools.tax_plan import get_tax_plan, get_latest_tax_plan, check_entitlement
 from app.tools.conversation import detect_life_event, create_professional_referral, get_conversation_history
@@ -51,7 +52,31 @@ _PROFESSIONAL_JUDGMENT = re.compile(
 )
 
 _WHAT_IF = re.compile(r"\bwhat if\b|\bwhat would happen\b|\bscenario\b", re.I)
-_PLAN_QUESTION = re.compile(r"\bmy (plan|tax plan|deductions|withholding|strategies|savings)\b", re.I)
+_PLAN_QUESTION = re.compile(r"\bmy\b(?:\s+\w+){0,2}\s+(plan|deductions|withholding|strategies|savings)\b", re.I)
+# PRD 4.4/4.5: an informational question ("what is/are...", "how does...",
+# "explain...") should be answered from official sources or a verified
+# constant -- even if it happens to mention a life-event keyword (e.g.
+# "home sale deduction"). Only first-person, actually-happened phrasing
+# ("I got married", "we sold our house") should route to the life-event
+# narrative branch.
+_INFO_QUESTION = re.compile(r"^\s*(what is|what are|what does|how does|how do|explain|what's)\b", re.I)
+
+_FILING_STATUS_OVERRIDES = [
+    (re.compile(r"\bmfj\b|married filing jointly|file(?:ing)? jointly|file as mfj", re.I), "married_joint"),
+    (re.compile(r"\bmfs\b|married filing separately|file(?:ing)? separately", re.I), "married_separate"),
+    (re.compile(r"\bhoh\b|head of household", re.I), "head_of_household"),
+]
+
+
+def _detect_stated_filing_status(message: str) -> str | None:
+    """PRD 4.5: a life event often changes the user's filing status before
+    their plan record is updated (e.g. 'I got married, planning to file
+    MFJ'). Prefer what they just told us over the stale plan value when
+    looking up filing-status-dependent constants."""
+    for pattern, status in _FILING_STATUS_OVERRIDES:
+        if pattern.search(message):
+            return status
+    return None
 _CHARITABLE = re.compile(r"\bcharitable donation|\bdonate\b|\bcharity\b", re.I)
 _SEP_IRA = re.compile(r"\bsep[- ]?ira\b", re.I)
 
@@ -116,6 +141,74 @@ _CONSTANT_KEYWORDS: list[tuple[re.Pattern, str, bool, str]] = [
 ]
 
 
+def _lookup_intake_category(plan, message: str) -> str | None:
+    """Answers questions directly from the structured intake data (the
+    real product's 8 intake sections) rather than the generic RAG
+    fallback -- this IS the user's own data, not something to search for."""
+    lowered = message.lower()
+
+    if any(w in lowered for w in ["dependent", "children", "kids", "child care", "childcare"]):
+        fe = plan.family_education or {}
+        deps = fe.get("dependents", [])
+        if deps:
+            names = ", ".join(d.get("name", "(unnamed)") for d in deps)
+            return f"You have {len(deps)} dependent(s) on file: {names}."
+        return "You don't have any dependents on file from your intake."
+
+    if any(w in lowered for w in ["real estate", "own a home", "own my home", "rental property", "brokerage"]):
+        re_data = plan.real_estate_assets or {}
+        parts = [
+            "You own your primary residence" if re_data.get("owns_primary_residence")
+            else "Your intake shows you don't own your primary residence (renting)"
+        ]
+        if re_data.get("owns_rental_property"):
+            parts.append("you also have rental property on file")
+        if re_data.get("brokerage_account_value"):
+            parts.append(f"brokerage account value on file: ${re_data['brokerage_account_value']:,.0f}")
+        return ", ".join(parts) + "."
+
+    if any(w in lowered for w in ["401k contribution", "retirement contribution", "how much am i contributing", "am i contributing"]):
+        rp = plan.retirement_planning or {}
+        parts = []
+        if rp.get("has_401k"):
+            parts.append(
+                f"you're contributing {rp.get('401k_contribution_pct', 0)}% to your 401(k), "
+                f"with a {rp.get('employer_match_pct', 0)}% employer match"
+            )
+        if rp.get("has_sep_ira"):
+            parts.append(f"SEP-IRA contributed year-to-date: ${rp.get('sep_ira_contribution_ytd', 0):,.0f}")
+        return ("On file: " + "; ".join(parts) + ".") if parts else "No retirement account contributions on file yet."
+
+    if any(w in lowered for w in ["do i itemize", "itemizing", "charitable contribution", "mortgage interest", "salt paid"]):
+        dg = plan.deductions_giving or {}
+        return (
+            f"On file: {'itemizing deductions' if dg.get('itemizes') else 'using the standard deduction'}, "
+            f"${dg.get('charitable_contributions_ytd', 0):,.0f} in charitable contributions this year, "
+            f"${dg.get('mortgage_interest_paid', 0):,.0f} in mortgage interest, "
+            f"and an estimated ${dg.get('salt_paid_estimate', 0):,.0f} in state and local taxes paid."
+        )
+
+    return None
+
+
+def _life_event_intake_note(plan, life_event: str) -> str:
+    """PRD 4.5: surface the specific intake data relevant to this event,
+    not just a generic constant."""
+    if life_event == "new_child_or_adoption":
+        fe = plan.family_education or {}
+        if not fe.get("has_529_plan"):
+            return " Your intake shows no 529 education savings plan on file yet -- worth discussing."
+    elif life_event == "retirement":
+        rp = plan.retirement_planning or {}
+        if rp.get("has_401k"):
+            return f" Your 401(k) is currently at {rp.get('401k_contribution_pct', 0)}% contribution on file."
+    elif life_event == "home_purchase_or_sale":
+        re_data = plan.real_estate_assets or {}
+        if not re_data.get("owns_primary_residence"):
+            return " Your intake currently shows no primary residence on file -- this would be a new addition."
+    return ""
+
+
 def _lookup_constant(db: Session, message: str, tax_year: int, filing_status: str) -> tuple[str, list[dict]] | None:
     """PRD 4.3: if the question matches a known IRS-defined constant,
     answer with the exact verified figure -- never fall through to a
@@ -168,7 +261,10 @@ def _scope_tags_for(message: str) -> list[str]:
 
 def _compose_from_sources(sources: list[dict], intro: str) -> tuple[str, list[dict]]:
     """PRD 4.4: every answer sourced from an official domain must include
-    that source's URL so the user can verify it themselves."""
+    that source's URL so the user can verify it themselves. PRD 6
+    (Availability): if retrieval didn't actually succeed, say so plainly
+    instead of presenting a generic domain description as if it were the
+    retrieved answer."""
     if not sources:
         return (
             f"{intro} I wasn't able to retrieve the exact figure from an official source just now. "
@@ -178,6 +274,17 @@ def _compose_from_sources(sources: list[dict], intro: str) -> tuple[str, list[di
         )
 
     top = sources[0]
+    if top.get("content_source") == "registry_metadata":
+        # No live discovery/extraction happened -- this is NOT retrieved
+        # guidance, just which domains are in scope. Say so honestly.
+        domains = ", ".join(s["domain"] for s in sources[:3])
+        return (
+            f"{intro} I wasn't able to retrieve specific guidance from an official source just now, "
+            f"but {domains} would have the relevant rules -- you're welcome to check there directly, "
+            f"or {REFERRAL_CTA} can look this up for you.",
+            [{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:3]],
+        )
+
     content = (top.get("content") or "").strip()
     snippet = content[:400] + ("..." if len(content) > 400 else "") if content else top.get("title", "")
 
@@ -196,15 +303,18 @@ def _get_current_plan(db: Session, user_id: str):
     return get_latest_tax_plan(db, user_id)
 
 
-def _plan_summary(plan) -> str:
-    """PRD 4.1: filing status, AGI/MAGI/marginal rate, savings, strategies."""
+def _plan_summary(plan, brief: bool = False) -> str:
+    """PRD 4.1: filing status, AGI/MAGI/marginal rate, savings, strategies.
+    brief=True omits the savings clause -- used when this is supporting
+    context for a different question rather than the answer itself, so
+    responses don't all read as a repeat of the full plan dump."""
     parts = [f"{plan.filing_status} filer, AGI ${plan.agi:,.0f}" if plan.agi else plan.filing_status]
     if plan.magi:
         parts.append(f"MAGI ${plan.magi:,.0f}")
     if plan.marginal_rate:
         parts.append(f"{plan.marginal_rate*100:.0f}% marginal bracket")
     summary = ", ".join(parts) + "."
-    if plan.confirmed_savings or plan.potential_savings:
+    if not brief and (plan.confirmed_savings or plan.potential_savings):
         summary += f" Confirmed savings so far: ${plan.confirmed_savings:,.0f}; potential additional savings identified: ${plan.potential_savings:,.0f}."
     return summary
 
@@ -231,7 +341,18 @@ _LIFE_EVENT_CONSTANTS: dict[str, list[tuple[str, bool]]] = {
 
 def _life_event_constant_note(db: Session, life_event: str, tax_year: int, filing_status: str) -> str:
     """PRD 4.5: life event handling must fetch the applicable tax
-    constants, not just narrative guidance."""
+    constants, not just narrative guidance. Where a direct before/after
+    comparison is meaningful (e.g. marriage changes filing status), states
+    both verified figures directly -- a concrete fact, not a hedge."""
+    if life_event in ("marriage", "divorce"):
+        single_val, single_year = get_tax_constant(db, tax_year, "standard_deduction", "single")
+        joint_val, joint_year = get_tax_constant(db, tax_year, "standard_deduction", "married_joint")
+        if single_val is not None and joint_val is not None:
+            return (
+                f" Standard deduction: ${single_val:,.0f} (single, {single_year}) vs. "
+                f"${joint_val:,.0f} (married filing jointly, {joint_year}), per IRS.gov."
+            )
+
     entries = _LIFE_EVENT_CONSTANTS.get(life_event, [])
     notes = []
     for key, needs_status in entries:
@@ -239,12 +360,12 @@ def _life_event_constant_note(db: Session, life_event: str, tax_year: int, filin
         if value is not None:
             label = key.replace("_", " ")
             notes.append(f"{label} ({actual_year}): ${value:,.0f}")
-    return " Relevant figures: " + "; ".join(notes) + "." if notes else ""
+    return " " + "; ".join(notes) + ", per IRS.gov." if notes else ""
 
 
-def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
-    """Entry point: eligibility gate -> rule-based intent -> tool call(s)
-    -> templated reply. Returns {reply, citations}."""
+def _run_body(db: Session, user_id: str, conversation_id: str, message: str, mcp) -> dict:
+    """Eligibility gate -> rule-based intent -> tool call(s) (via the real
+    MCP protocol for RAG tools) -> templated reply. Returns {reply, citations}."""
 
     # --- PRD Section 3: paid subscribers with a completed plan only ---
     tier = check_entitlement(db, user_id)
@@ -296,27 +417,67 @@ def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
 
     scope_tags = _scope_tags_for(message)
 
+    # --- Hypothetical life event (PRD 4.6 what-if, informed by 4.5's
+    # constant-fetching requirement): "what if I get married next year" is
+    # a forward-looking scenario question -- it has NOT happened. Must be
+    # phrased conditionally, not as an already-true fact, and shouldn't
+    # file the same referral as an actual reported event. Checked BEFORE
+    # the actual-life-event branch so tense is never misread. ---
+    hypothetical_event = None if _INFO_QUESTION.search(message) else detect_life_event(message)
+    if hypothetical_event and _WHAT_IF.search(message):
+        label = hypothetical_event.replace("_", " ")
+        effective_filing_status = _detect_stated_filing_status(message) or plan.filing_status
+        constant_note = _life_event_constant_note(db, hypothetical_event, plan.tax_year, effective_filing_status)
+        intake_note = _life_event_intake_note(plan, hypothetical_event)
+        relevant = _relevant_strategies(plan, scope_tags)
+        strategy_note = ""
+        if relevant:
+            titles = ", ".join(s.title for s in relevant[:2])
+            strategy_note = f" Related strategies already on your plan: {titles}."
+
+        fact = constant_note if constant_note else " I don't have a verified figure that changes specifically for this scenario -- I won't guess at one."
+
+        reply = (
+            f"{label.capitalize()} -- your plan on file: {_plan_summary(plan, brief=True)}{fact}{strategy_note}{intake_note}\n\n"
+            f"Nothing on your plan changes until this actually happens. When it does, "
+            f"{REFERRAL_CTA} to update your plan."
+        )
+        return {"reply": reply, "citations": [{"label": "irs.gov", "url": "https://www.irs.gov"}] if constant_note else []}
+
     # --- Life event (PRD 4.5): identify -> IRS guidance -> tax constants
-    # -> personalized impact -> relevant plan strategies -> referral. ---
-    life_event = detect_life_event(message)
+    # -> personalized impact -> relevant plan strategies -> referral.
+    # Gated behind _INFO_QUESTION: "what is the strategy for X" is a rule
+    # question (PRD 4.4), not a report that X actually happened to the
+    # user -- only first-person/narrative phrasing triggers this branch. ---
+    life_event = hypothetical_event
     if life_event:
         create_professional_referral(db, user_id, conversation_id, reason=f"Life event: {life_event}")
-        sources = search_official_sources(db, scope_tags or ["general"], tier, query=f"{life_event.replace('_', ' ')} tax impact")
+        sources = mcp.call("search_official_sources", {"query": f"{life_event.replace('_', ' ')} tax impact", "user_id": user_id, "scope_tags": scope_tags or ["general"]})
         label = life_event.replace("_", " ")
         relevant = _relevant_strategies(plan, scope_tags)
         strategy_note = ""
         if relevant:
             titles = ", ".join(s.title for s in relevant[:2])
-            strategy_note = f" This may also change the relevance of strategies already on your plan, including: {titles}."
+            strategy_note = f" Related strategies already on your plan: {titles}."
+
+        # PRD 4.5: use a filing status the user just stated (e.g. "planning
+        # to file MFJ") over the stale plan value for constant lookups.
+        effective_filing_status = _detect_stated_filing_status(message) or plan.filing_status
+        status_note = (
+            f" (Using {effective_filing_status.replace('_', ' ')} for the figures below, based on what "
+            f"you just told me -- your plan on file still shows {plan.filing_status.replace('_', ' ')} until it's updated.)"
+            if effective_filing_status != plan.filing_status else ""
+        )
 
         reply = (
-            f"I see this involves {label} -- events like this typically affect your filing status, "
-            f"withholding, and which deductions or credits you qualify for. Based on your current plan "
-            f"({_plan_summary(plan)}), this is worth reviewing closely.{strategy_note}"
-            f"{_life_event_constant_note(db, life_event, plan.tax_year, plan.filing_status)}\n\n"
+            f"{label.capitalize()} -- your plan on file: {_plan_summary(plan, brief=True)}{status_note}{strategy_note}"
+            f"{_life_event_constant_note(db, life_event, plan.tax_year, effective_filing_status)}"
+            f"{_life_event_intake_note(plan, life_event)}\n\n"
         )
-        if sources:
+        if sources and sources[0].get("content_source") != "registry_metadata":
             reply += f"Relevant guidance from {sources[0]['domain']}: {(sources[0].get('content') or '')[:300]}\n\n"
+        elif sources:
+            reply += f"I wasn't able to pull specific guidance just now -- you can review {sources[0]['domain']} directly for {label}-related rules.\n\n"
         reply += f"{REFERRAL_CTA} to update your plan for this change."
         citations = [{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:2]]
         return {"reply": reply, "citations": citations}
@@ -374,11 +535,29 @@ def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
             )
             return {"reply": reply, "citations": []}
         except ValueError:
-            sources = search_official_sources(db, scope_tags, tier, query=message)
+            sources = mcp.call("search_official_sources", {"query": message, "user_id": user_id, "scope_tags": scope_tags})
             reply, citations = _compose_from_sources(sources, "I don't have bracket data for that scenario on file, but here's relevant guidance:")
             return {"reply": reply, "citations": citations}
 
     # --- Plan question (PRD 4.1): answer from the user's actual plan. ---
+    if re.search(r"\bwhy does\b.*\bapply\b", message, re.I):
+        # Matches our own contextual-suggestion wording ("Why does 'X' apply
+        # to me?") -- answer with the strategy's actual rationale, not a
+        # generic constant lookup that happens to share a keyword with it.
+        for s in plan.strategies:
+            if s.title.lower() in message.lower():
+                return {
+                    "reply": f"{s.title}: {s.why_it_applies or s.description} (Estimated savings: ${s.estimated_savings:,.0f}, status: {s.status}.)",
+                    "citations": [],
+                }
+
+    # --- Direct intake-data lookup: this IS the user's own data (from the
+    # 8-section intake), and more specific than the full-plan dump below --
+    # checked first so "am I itemizing" doesn't just return the whole plan. ---
+    intake_answer = _lookup_intake_category(plan, message)
+    if intake_answer:
+        return {"reply": intake_answer, "citations": []}
+
     if _PLAN_QUESTION.search(message):
         strategies_text = "\n".join(
             f"- {s.title} ({s.status}, est. ${s.estimated_savings:,.0f}): {s.why_it_applies or s.description}"
@@ -397,11 +576,21 @@ def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
         return {"reply": reply, "citations": citations}
 
     # --- Default: internal knowledge first, then live official sources. ---
-    internal_hits = search_internal_knowledge(db, message)
+    internal_hits = mcp.call("search_internal_knowledge", {"query": message})
     if internal_hits:
         content = internal_hits[0]["content"][:400]
         return {"reply": f"From verified internal guidance: {content}", "citations": []}
 
-    sources = search_official_sources(db, scope_tags, tier, query=message)
+    sources = mcp.call("search_official_sources", {"query": message, "user_id": user_id, "scope_tags": scope_tags})
     reply, citations = _compose_from_sources(sources, "Here's what I found:")
     return {"reply": reply, "citations": citations}
+
+
+def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
+    """Entry point. Opens one MCP session for this turn (see
+    app/mcp_bridge.py) so every internal/external source lookup during
+    this request goes through the real Model Context Protocol -- not a
+    direct function import -- then delegates to _run_body for the
+    deterministic routing and reply composition."""
+    with mcp_turn() as mcp:
+        return _run_body(db, user_id, conversation_id, message, mcp)

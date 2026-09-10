@@ -10,17 +10,20 @@ from datetime import date
 router = APIRouter()
 
 
-@router.get("/tax-plan/{user_id}/{tax_year}")
-def get_plan(user_id: str, tax_year: int, db: Session = Depends(get_db)):
-    tier = check_entitlement(db, user_id)
-    plan = get_tax_plan(db, user_id, tax_year)
-    if not plan:
-        return {"tier": tier, "found": False, "summary": "No tax plan on file for this year yet."}
+def _serialize_plan(tier: str, plan) -> dict:
     return {
         "tier": tier,
         "found": True,
+        "tax_year": plan.tax_year,
         "filing_status": plan.filing_status,
-        "data": plan.data,
+        "filing_info": plan.filing_info,
+        "age_planning": plan.age_planning,
+        "income_planning": plan.income_planning,
+        "retirement_planning": plan.retirement_planning,
+        "family_education": plan.family_education,
+        "real_estate_assets": plan.real_estate_assets,
+        "deductions_giving": plan.deductions_giving,
+        "life_changes": plan.life_changes,
         "agi": plan.agi,
         "magi": plan.magi,
         "marginal_rate": plan.marginal_rate,
@@ -39,6 +42,26 @@ def get_plan(user_id: str, tax_year: int, db: Session = Depends(get_db)):
             for s in plan.strategies
         ],
     }
+
+
+@router.get("/tax-plan/{user_id}")
+def get_latest_plan(user_id: str, db: Session = Depends(get_db)):
+    """Dashboard-facing endpoint: the user's most recent plan, whichever
+    tax year that is -- avoids the frontend having to know/guess a year."""
+    tier = check_entitlement(db, user_id)
+    plan = get_latest_tax_plan(db, user_id)
+    if not plan:
+        return {"tier": tier, "found": False, "summary": "No tax plan on file yet -- complete your intake to get started."}
+    return _serialize_plan(tier, plan)
+
+
+@router.get("/tax-plan/{user_id}/{tax_year}")
+def get_plan(user_id: str, tax_year: int, db: Session = Depends(get_db)):
+    tier = check_entitlement(db, user_id)
+    plan = get_tax_plan(db, user_id, tax_year)
+    if not plan:
+        return {"tier": tier, "found": False, "summary": "No tax plan on file for this year yet."}
+    return _serialize_plan(tier, plan)
 
 
 @router.get("/suggestions/{user_id}")

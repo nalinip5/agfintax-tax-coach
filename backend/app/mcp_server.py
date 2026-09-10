@@ -20,6 +20,7 @@ from app.db import SessionLocal
 from app.tools.knowledge import (
     search_internal_knowledge as _search_internal_knowledge,
     search_official_sources as _search_official_sources,
+    ingest_document as _ingest_document,
 )
 from app.tools.tax_calc import (
     calculate_tax_scenario as _calculate_tax_scenario,
@@ -27,6 +28,8 @@ from app.tools.tax_calc import (
 )
 from app.tools.tax_plan import get_tax_plan as _get_tax_plan, check_entitlement as _check_entitlement
 from app.tools.conversation import create_professional_referral as _create_professional_referral
+from app.tools.document_intelligence import extract_text as _extract_text, DocumentIntelligenceError
+from app.tools.pii_scrub import scrub_pii as _scrub_pii
 
 mcp = FastMCP("agfintax-tools")
 
@@ -106,6 +109,46 @@ def create_professional_referral(user_id: str, conversation_id: str, reason: str
     try:
         _create_professional_referral(db, user_id, conversation_id, reason)
         return json.dumps({"referred": True})
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def upload_and_extract_document(title: str, file_base64: str, content_type: str) -> str:
+    """Document Intelligence tool: OCR-extracts text from an uploaded file
+    (base64-encoded) via Azure Document Intelligence, redacts PII from the
+    RAW extracted text BEFORE anything else happens, and only then ingests
+    the scrubbed text as an internal (unpublished) document.
+
+    Security guarantee: the raw, unscrubbed OCR output never leaves this
+    function -- it is not returned, not logged, and not passed to any
+    other tool or caller. Only the scrubbed text and redaction summary
+    are ever surfaced. Returns a JSON-encoded dict."""
+    import base64
+
+    db = SessionLocal()
+    try:
+        raw_bytes = base64.b64decode(file_base64)
+        try:
+            raw_text = _extract_text(raw_bytes, content_type)
+        except DocumentIntelligenceError as exc:
+            return json.dumps({"error": f"OCR extraction failed: {exc}"})
+        finally:
+            del raw_bytes
+
+        scrub_result = _scrub_pii(raw_text)
+        del raw_text  # raw, unscrubbed text must not survive past this point
+
+        doc = _ingest_document(db, title=title, source_domain=None, content=scrub_result.scrubbed_text)
+        return json.dumps(
+            {
+                "id": doc.id,
+                "title": doc.title,
+                "published": doc.published,
+                "redacted_categories": scrub_result.redacted_categories,
+                "redaction_count": scrub_result.redaction_count,
+            }
+        )
     finally:
         db.close()
 

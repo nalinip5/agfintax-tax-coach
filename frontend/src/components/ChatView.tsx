@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { api, Citation } from '../lib/api'
+import DocumentUpload from './DocumentUpload'
 
 type Message = {
   role: 'user' | 'assistant'
@@ -45,7 +46,7 @@ function LifeEventCard() {
 // not currently wired to a specific displayable signal from the single-agent response.
 void LifeEventCard;
 
-export default function ChatView() {
+export default function ChatView({ pendingQuestion }: { pendingQuestion?: string | null } = {}) {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: 'assistant',
@@ -66,6 +67,10 @@ export default function ChatView() {
   useEffect(() => {
     api.suggestions(USER_ID).then((r) => setSuggestions(r.suggestions)).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (pendingQuestion) setInput(pendingQuestion)
+  }, [pendingQuestion])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -103,7 +108,7 @@ export default function ChatView() {
       <aside className="hidden w-64 shrink-0 flex-col gap-4 lg:flex">
         <div className="rounded-xl border border-ledger-200 bg-white p-4">
           <h2 className="font-serif text-lg text-ledger-900">This year</h2>
-          <p className="mt-1 text-sm text-ledger-700">Tax year 2025 · Single filer</p>
+          <p className="mt-1 text-sm text-ledger-700">Tax year 2026 · Single filer</p>
           <div className="mt-3 h-px bg-ledger-100" />
           <p className="mt-3 text-xs uppercase tracking-wide text-ledger-600">Usage today</p>
           {usage ? (
@@ -137,6 +142,7 @@ export default function ChatView() {
             ))}
           </ul>
         </div>
+        <DocumentUpload />
       </aside>
 
       {/* Chat column */}
@@ -153,8 +159,8 @@ export default function ChatView() {
                 <div
                   className={
                     m.role === 'user'
-                      ? 'max-w-[75%] rounded-2xl rounded-tr-sm bg-ledger-700 px-4 py-2.5 text-sm text-white'
-                      : `max-w-[85%] rounded-2xl rounded-tl-sm px-4 py-2.5 text-sm ${
+                      ? 'max-w-[75%] rounded-2xl rounded-tr-sm bg-ledger-700 px-4 py-2.5 text-sm text-white whitespace-pre-line'
+                      : `max-w-[85%] rounded-2xl rounded-tl-sm px-4 py-2.5 text-sm whitespace-pre-line ${
                           m.blocked ? 'bg-clay-500/10 text-clay-600 border border-clay-500/30' : 'bg-ledger-50 text-ledger-900'
                         }`
                   }

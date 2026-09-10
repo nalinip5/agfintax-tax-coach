@@ -18,6 +18,51 @@ export type Source = {
   tier: string[]
 }
 
+export type Strategy = {
+  title: string
+  description: string
+  why_it_applies: string | null
+  status: string
+  estimated_savings: number | null
+}
+
+export type PlanData = {
+  tier: string
+  found: boolean
+  summary?: string
+  tax_year?: number
+  filing_status?: string
+  filing_info?: { state?: string; occupation?: string; spouse_occupation?: string | null }
+  age_planning?: { taxpayer_age?: number; spouse_age?: number | null; retirement_age_target?: number }
+  income_planning?: {
+    wages?: number
+    self_employment_income?: number
+    investment_income?: number
+    federal_tax_withheld?: number
+    estimated_payments_made?: number
+  }
+  retirement_planning?: {
+    has_401k?: boolean
+    "401k_contribution_pct"?: number
+    employer_match_pct?: number
+    has_traditional_ira?: boolean
+    has_sep_ira?: boolean
+    sep_ira_contribution_ytd?: number
+  }
+  family_education?: { dependents?: { name?: string }[]; has_dependent_care_expenses?: boolean; has_529_plan?: boolean }
+  real_estate_assets?: { owns_primary_residence?: boolean; owns_rental_property?: boolean; brokerage_account_value?: number }
+  deductions_giving?: { itemizes?: boolean; charitable_contributions_ytd?: number; mortgage_interest_paid?: number; salt_paid_estimate?: number }
+  life_changes?: string[]
+  agi?: number
+  magi?: number
+  marginal_rate?: number
+  confirmed_savings?: number
+  potential_savings?: number
+  urgent_observations?: string[]
+  missing_questionnaire_items?: string[]
+  strategies?: Strategy[]
+}
+
 // In dev, Vite's proxy (vite.config.ts) forwards /api -> localhost:8010.
 // In production (e.g. a static host), set VITE_API_BASE to the deployed
 // backend's URL at build time, or rely on the host's own /api rewrite rule.
@@ -65,4 +110,22 @@ export const api = {
 
   publishDocument: (id: string) => fetch(`${BASE}/kb/documents/${id}/publish`, { method: 'POST' }).then(json),
   unpublishDocument: (id: string) => fetch(`${BASE}/kb/documents/${id}/unpublish`, { method: 'POST' }).then(json),
+
+  // Client-facing document upload: OCR (Azure Document Intelligence) -> PII scrub -> ingest.
+  // Distinct from uploadDocument above (which is the admin plain-text ingestion path).
+  uploadDocumentFile: (user_id: string, title: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    const params = new URLSearchParams({ user_id, title })
+    return fetch(`${BASE}/documents/upload?${params}`, { method: 'POST', body: form }).then(json<{
+      id: string
+      title: string
+      published: boolean
+      redacted_categories: string[]
+      redaction_count: number
+      note: string
+    }>)
+  },
+
+  getLatestPlan: (user_id: string) => fetch(`${BASE}/tax-plan/${user_id}`).then(json<PlanData>),
 }

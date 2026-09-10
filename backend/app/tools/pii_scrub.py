@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 _PATTERNS = {
     "ssn": re.compile(r"\b\d{3}-?\d{2}-?\d{4}\b"),
+    "ssn_labeled": re.compile(r"\b(ssn|social security( number)?)\b[^\d]{0,15}\d[\d\-\s]{7,13}\d", re.IGNORECASE),
     "ein": re.compile(r"\b\d{2}-\d{7}\b"),
     "credit_card": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
     "dob": re.compile(r"\b(0[1-9]|1[0-2])[/\-](0[1-9]|[12]\d|3[01])[/\-](19|20)\d{2}\b"),
@@ -20,6 +21,7 @@ _PATTERNS = {
     "routing_number": re.compile(r"\b\d{9}\b"),
     "email": re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
     "phone": re.compile(r"\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    "password": re.compile(r"\bpassword\s*[:=]\s*\S+", re.IGNORECASE),
 }
 
 

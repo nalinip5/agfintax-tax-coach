@@ -49,10 +49,25 @@ class TaxPlan(Base):
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     tax_year = Column(Integer, nullable=False)
     filing_status = Column(String, nullable=False, default="single")
-    data = Column(JSON, default=dict)  # income, deductions, accounts, etc.
+
+    # --- Intake data, structured to match the real AGFinTax intake flow's
+    # 8 sections (see "Your Intake Journey" in the product UI) -- each a
+    # JSON blob since fields genuinely vary per household (dependents,
+    # properties, accounts), rather than one generic catch-all blob. This
+    # is what lets Tax Coach answer from a SPECIFIC section instead of
+    # guessing at unstructured data. ---
+    filing_info = Column(JSON, default=dict)  # state, occupation, spouse occupation
+    age_planning = Column(JSON, default=dict)  # taxpayer/spouse age, milestones
+    income_planning = Column(JSON, default=dict)  # wages, SE income, withholding, estimated payments
+    retirement_planning = Column(JSON, default=dict)  # 401k/IRA/SEP status, contribution rates
+    family_education = Column(JSON, default=dict)  # dependents, childcare, education expenses/accounts
+    real_estate_assets = Column(JSON, default=dict)  # residence, rental property, investment accounts
+    deductions_giving = Column(JSON, default=dict)  # itemize/standard, charitable, mortgage interest, SALT
+    life_changes = Column(JSON, default=list)  # life events reported during intake
 
     # --- Plan-aware fields (PRD 4.1) -- Tax Coach must always have these
-    # without the user re-explaining their situation. ---
+    # without the user re-explaining their situation. Derived from the
+    # intake sections above once a plan is run. ---
     agi = Column(Float, nullable=True)
     magi = Column(Float, nullable=True)
     marginal_rate = Column(Float, nullable=True)
