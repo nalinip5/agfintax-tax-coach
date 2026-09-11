@@ -12,17 +12,17 @@ chosen tool gets invoked.
 Uses anyio's blocking portal (not a bare asyncio event loop) because the
 MCP client's async context managers use anyio cancel scopes internally,
 which require entry and exit to happen within the same underlying task --
-a plain `loop.run_until_complete()` per call violates that. The portal
-runs one persistent background task for the whole turn, so the session
-can be opened, used for several calls, and cleanly closed.
+a plain `loop.run_until_complete()` per call violates that.
 
-One MCP session is opened per chat turn (see mcp_turn()) and reused for
-every tool call within that turn, rather than spawning a new server
-subprocess per call.
-
-Production note: for higher traffic, replace the per-turn portal/session
-with one long-lived portal opened at app startup and reused across
-requests.
+IMPORTANT: this maintains ONE PERSISTENT session for the whole app
+lifetime (started at FastAPI startup, closed at shutdown) -- NOT one
+session per chat turn. Spawning a fresh Python subprocess (interpreter
+startup + importing the whole app + protocol handshake) on every single
+message is real overhead that caused actual request failures/timeouts
+under real traffic on a resource-constrained host, even though it worked
+fine for a single manual curl test. One long-lived session avoids that
+entirely; WEB_CONCURRENCY=1 means a single worker process handles all
+requests anyway, so one shared session is both safe and correct here.
 """
 from contextlib import contextmanager
 
@@ -43,20 +43,53 @@ class _SyncMCPSession:
         return self._portal.call(call_tool, self._session, tool_name, arguments)
 
 
+_state: dict = {"portal": None, "portal_cm": None, "wrapped": None, "session": None}
+
+
+def start_persistent_session() -> None:
+    """Call once, at app startup. Spawns the MCP server subprocess ONCE
+    and keeps the session open for the app's lifetime."""
+    if _state["session"] is not None:
+        return  # already started
+    portal_cm = anyio.from_thread.start_blocking_portal()
+    portal = portal_cm.__enter__()
+    wrapped = portal.wrap_async_context_manager(mcp_session())
+    session = wrapped.__enter__()
+    _state.update(portal=portal, portal_cm=portal_cm, wrapped=wrapped, session=session)
+
+
+def stop_persistent_session() -> None:
+    """Call once, at app shutdown. Must exit the SAME wrapped context
+    manager instance that start_persistent_session() entered -- creating
+    a fresh wrap_async_context_manager() call here for __exit__ hangs
+    indefinitely, since anyio's cancel-scope bookkeeping is tied to that
+    specific instance, not just the underlying session object."""
+    if _state["session"] is None:
+        return
+    wrapped = _state["wrapped"]
+    portal_cm = _state["portal_cm"]
+    try:
+        wrapped.__exit__(None, None, None)
+    finally:
+        portal_cm.__exit__(None, None, None)
+    _state.update(portal=None, portal_cm=None, wrapped=None, session=None)
+
+
+def get_mcp() -> _SyncMCPSession:
+    """Returns the persistent session for use in a request. Falls back to
+    lazily starting one if the app didn't call start_persistent_session()
+    (e.g. in tests) so callers never crash on a missing session."""
+    if _state["session"] is None:
+        start_persistent_session()
+    return _SyncMCPSession(_state["portal"], _state["session"])
+
+
 @contextmanager
 def mcp_turn():
-    """Context manager: opens one MCP session (one server subprocess),
-    backed by one anyio blocking portal, for the duration of a `with`
-    block -- yielding a sync-callable wrapper.
-
-    Uses portal.wrap_async_context_manager(), anyio's purpose-built
-    bridge for entering/exiting one async context manager safely from
-    synchronous code across multiple calls -- a bare portal.call() on
-    __aenter__/__aexit__ separately schedules them as different tasks
-    and violates anyio's cancel-scope task affinity."""
-    with anyio.from_thread.start_blocking_portal() as portal:
-        with portal.wrap_async_context_manager(mcp_session()) as session:
-            yield _SyncMCPSession(portal, session)
+    """Back-compat context-manager form -- now just yields the shared
+    persistent session rather than opening a new one, so existing
+    `with mcp_turn() as mcp:` call sites keep working unchanged."""
+    yield get_mcp()
 
 
 def encode_file(raw_bytes: bytes) -> str:

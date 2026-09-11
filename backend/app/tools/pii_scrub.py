@@ -17,11 +17,11 @@ _PATTERNS = {
     "ein": re.compile(r"\b\d{2}-\d{7}\b"),
     "credit_card": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
     "dob": re.compile(r"\b(0[1-9]|1[0-2])[/\-](0[1-9]|[12]\d|3[01])[/\-](19|20)\d{2}\b"),
-    "account_number": re.compile(r"\b(?:account|acct)\s*#?\s*[:\-]?\s*\d{6,}\b", re.IGNORECASE),
+    "account_number": re.compile(r"\b(?:account|acct)\b.{0,20}?\d{6,}\b", re.IGNORECASE),
     "routing_number": re.compile(r"\b\d{9}\b"),
     "email": re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
     "phone": re.compile(r"\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
-    "password": re.compile(r"\bpassword\s*[:=]\s*\S+", re.IGNORECASE),
+    "password": re.compile(r"\bpassword\b\s*(?:is|are|[:=])\s*\S{3,}", re.IGNORECASE),
 }
 
 
