@@ -25,8 +25,7 @@ import re
 
 from sqlalchemy.orm import Session
 
-from app.tools.knowledge import search_internal_knowledge, search_official_sources  # noqa: F401 -- kept for the deterministic fallback path below
-from app.mcp_bridge import mcp_turn
+from app.tools.knowledge import search_internal_knowledge, search_official_sources
 from app.tools.tax_calc import calculate_tax_scenario, get_tax_constant
 from app.tools.tax_plan import get_tax_plan, get_latest_tax_plan, check_entitlement
 from app.tools.conversation import detect_life_event, create_professional_referral, get_conversation_history
@@ -363,7 +362,7 @@ def _life_event_constant_note(db: Session, life_event: str, tax_year: int, filin
     return " " + "; ".join(notes) + ", per IRS.gov." if notes else ""
 
 
-def _run_body(db: Session, user_id: str, conversation_id: str, message: str, mcp) -> dict:
+def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
     """Eligibility gate -> rule-based intent -> tool call(s) (via the real
     MCP protocol for RAG tools) -> templated reply. Returns {reply, citations}."""
 
@@ -452,7 +451,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str, mcp
     life_event = hypothetical_event
     if life_event:
         create_professional_referral(db, user_id, conversation_id, reason=f"Life event: {life_event}")
-        sources = mcp.call("search_official_sources", {"query": f"{life_event.replace('_', ' ')} tax impact", "user_id": user_id, "scope_tags": scope_tags or ["general"]})
+        sources = search_official_sources(db, scope_tags or ["general"], tier, query=f"{life_event.replace('_', ' ')} tax impact")
         label = life_event.replace("_", " ")
         relevant = _relevant_strategies(plan, scope_tags)
         strategy_note = ""
@@ -531,11 +530,11 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str, mcp
             reply = (
                 f"For a {plan.filing_status} filer earning ${result['income']:,.0f}, estimated federal tax is "
                 f"${result['estimated_federal_tax']:,.2f} (effective rate {result['effective_rate']*100:.1f}%)"
-                f"{year_note}."
+                f"{year_note}, based on IRS {result['tax_year']} federal income tax brackets."
             )
-            return {"reply": reply, "citations": []}
+            return {"reply": reply, "citations": [{"label": "irs.gov", "url": "https://www.irs.gov"}]}
         except ValueError:
-            sources = mcp.call("search_official_sources", {"query": message, "user_id": user_id, "scope_tags": scope_tags})
+            sources = search_official_sources(db, scope_tags, tier, query=message)
             reply, citations = _compose_from_sources(sources, "I don't have bracket data for that scenario on file, but here's relevant guidance:")
             return {"reply": reply, "citations": citations}
 
@@ -576,21 +575,24 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str, mcp
         return {"reply": reply, "citations": citations}
 
     # --- Default: internal knowledge first, then live official sources. ---
-    internal_hits = mcp.call("search_internal_knowledge", {"query": message})
+    internal_hits = search_internal_knowledge(db, message)
     if internal_hits:
         content = internal_hits[0]["content"][:400]
         return {"reply": f"From verified internal guidance: {content}", "citations": []}
 
-    sources = mcp.call("search_official_sources", {"query": message, "user_id": user_id, "scope_tags": scope_tags})
+    sources = search_official_sources(db, scope_tags, tier, query=message)
     reply, citations = _compose_from_sources(sources, "Here's what I found:")
     return {"reply": reply, "citations": citations}
 
 
 def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
-    """Entry point. Opens one MCP session for this turn (see
-    app/mcp_bridge.py) so every internal/external source lookup during
-    this request goes through the real Model Context Protocol -- not a
-    direct function import -- then delegates to _run_body for the
-    deterministic routing and reply composition."""
-    with mcp_turn() as mcp:
-        return _run_body(db, user_id, conversation_id, message, mcp)
+    """Entry point. Calls the RAG/tool functions directly (no MCP
+    subprocess indirection on the live request path) -- a real MCP
+    server/client pair still exists in app/mcp_server.py and
+    app/mcp_client.py, tested and available for an LLM-driven or
+    external-host integration later, but spawning/coordinating a
+    subprocess for every chat message proved too fragile on a
+    resource-constrained host and added a failure mode with no
+    corresponding benefit for a deterministic (non-LLM) router, which
+    never needed dynamic tool discovery in the first place."""
+    return _run_body(db, user_id, conversation_id, message)
