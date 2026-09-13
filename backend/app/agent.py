@@ -35,7 +35,7 @@ REFERRAL_CTA = "Talk to our AGFinTax Tax Planner"
 # --- PRD Section 7: explicitly out of scope, regardless of phrasing ---
 _OUT_OF_SCOPE = re.compile(
     r"\b(weather|sports score|recipe|write me a poem|"
-    r"buy|sell|hold\b.*(stock|shares|crypto|bitcoin)|portfolio alloc|"
+    r"(buy|sell|hold)\b.*\b(stock|shares|crypto|bitcoin)|portfolio alloc|"
     r"interpret (this|my) (contract|will|trust)|legal advice|"
     r"state tax|state return|"
     r"corporate (tax|return)|partnership return|trust return|"
@@ -76,6 +76,30 @@ def _detect_stated_filing_status(message: str) -> str | None:
         if pattern.search(message):
             return status
     return None
+
+
+def _recent_conversation_context(history: list) -> tuple[str | None, str | None]:
+    """PRD 4.9: the user must not need to repeat themselves within a
+    session. Scans the last 15 turns' USER messages (already fetched by
+    the caller) for facts they've already told the system -- a stated
+    filing-status change, a mentioned life event -- so a later question
+    that doesn't restate them still benefits from that context. Most
+    recent mention wins. Returns (recent_life_event, recent_filing_status).
+    """
+    recent_life_event = None
+    recent_filing_status = None
+    for turn in history:
+        if turn.role != "user":
+            continue
+        life_event = detect_life_event(turn.content)
+        if life_event:
+            recent_life_event = life_event
+        status = _detect_stated_filing_status(turn.content)
+        if status:
+            recent_filing_status = status
+    return recent_life_event, recent_filing_status
+
+
 _CHARITABLE = re.compile(r"\bcharitable donation|\bdonate\b|\bcharity\b", re.I)
 _SEP_IRA = re.compile(r"\bsep[- ]?ira\b", re.I)
 
@@ -138,6 +162,25 @@ _CONSTANT_KEYWORDS: list[tuple[re.Pattern, str, bool, str]] = [
     (re.compile(r"standard deduction", re.I), "standard_deduction", True, "standard deduction"),
     (re.compile(r"child tax credit", re.I), "child_tax_credit_per_child", False, "Child Tax Credit"),
 ]
+
+
+def _lookup_plan_metric(plan, message: str) -> str | None:
+    """PRD 'Plan Context Automatic Load': direct questions about the
+    user's own core plan metrics (marginal rate, AGI, MAGI, filing status)
+    must be answered straight from session/plan data, not sent through
+    RAG. This is the user's own data, not a search target."""
+    lowered = message.lower()
+    if "marginal" in lowered and ("rate" in lowered or "bracket" in lowered):
+        if plan.marginal_rate is None:
+            return "I don't have a marginal rate on file for you yet."
+        return f"Your marginal tax rate is {plan.marginal_rate*100:.0f}%, based on your {plan.filing_status} filing status and AGI of ${plan.agi:,.0f}."
+    if re.search(r"\bmy agi\b", lowered) and "magi" not in lowered:
+        return f"Your AGI on file is ${plan.agi:,.0f}." if plan.agi is not None else "I don't have an AGI on file for you yet."
+    if re.search(r"\bmy magi\b", lowered):
+        return f"Your MAGI on file is ${plan.magi:,.0f}." if plan.magi is not None else "I don't have a MAGI on file for you yet."
+    if "filing status" in lowered:
+        return f"Your filing status on file is {plan.filing_status.replace('_', ' ')}."
+    return None
 
 
 def _lookup_intake_category(plan, message: str) -> str | None:
@@ -391,7 +434,11 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
     # Pulled for continuity/audit per PRD 4.9; deterministic replies don't
     # need it to change content, but a real conversational agent would use
     # it to avoid asking the user to repeat themselves.
+    # PRD 4.9: don't make the user repeat facts they already told us this
+    # session -- carry forward the most recently stated filing status /
+    # life event from earlier turns as fallback context.
     _history = get_conversation_history(db, conversation_id, limit=15)
+    _recent_life_event, _recent_filing_status = _recent_conversation_context(_history)
 
     if _OUT_OF_SCOPE.search(message):
         return {
@@ -425,7 +472,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
     hypothetical_event = None if _INFO_QUESTION.search(message) else detect_life_event(message)
     if hypothetical_event and _WHAT_IF.search(message):
         label = hypothetical_event.replace("_", " ")
-        effective_filing_status = _detect_stated_filing_status(message) or plan.filing_status
+        effective_filing_status = _detect_stated_filing_status(message) or _recent_filing_status or plan.filing_status
         constant_note = _life_event_constant_note(db, hypothetical_event, plan.tax_year, effective_filing_status)
         intake_note = _life_event_intake_note(plan, hypothetical_event)
         relevant = _relevant_strategies(plan, scope_tags)
@@ -461,7 +508,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
 
         # PRD 4.5: use a filing status the user just stated (e.g. "planning
         # to file MFJ") over the stale plan value for constant lookups.
-        effective_filing_status = _detect_stated_filing_status(message) or plan.filing_status
+        effective_filing_status = _detect_stated_filing_status(message) or _recent_filing_status or plan.filing_status
         status_note = (
             f" (Using {effective_filing_status.replace('_', ' ')} for the figures below, based on what "
             f"you just told me -- your plan on file still shows {plan.filing_status.replace('_', ' ')} until it's updated.)"
@@ -550,6 +597,12 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
                     "citations": [],
                 }
 
+    # --- Direct plan-metric lookup (marginal rate, AGI, MAGI, filing
+    # status): core session context, checked first. ---
+    metric_answer = _lookup_plan_metric(plan, message)
+    if metric_answer:
+        return {"reply": metric_answer, "citations": []}
+
     # --- Direct intake-data lookup: this IS the user's own data (from the
     # 8-section intake), and more specific than the full-plan dump below --
     # checked first so "am I itemizing" doesn't just return the whole plan. ---
@@ -569,7 +622,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
 
     # --- Direct IRS constant lookup (PRD 4.3) -- checked before any RAG
     # fallback, since these must be answered from the verified DB exactly. ---
-    constant_answer = _lookup_constant(db, message, plan.tax_year, plan.filing_status)
+    constant_answer = _lookup_constant(db, message, plan.tax_year, _detect_stated_filing_status(message) or _recent_filing_status or plan.filing_status)
     if constant_answer:
         reply, citations = constant_answer
         return {"reply": reply, "citations": citations}
@@ -586,13 +639,39 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
 
 
 def run(db: Session, user_id: str, conversation_id: str, message: str) -> dict:
-    """Entry point. Calls the RAG/tool functions directly (no MCP
-    subprocess indirection on the live request path) -- a real MCP
+    """Entry point. If an LLM is configured (LLM_PROVIDER + matching API
+    key), uses LLM-driven tool-calling (app.llm_agent) for natural-
+    language flexibility -- the same verified tools, under a strict
+    grounding system prompt, with the LLM never stating a number that
+    didn't come from a tool call this turn.
+
+    Falls back to the fully deterministic router (_run_body) if no LLM is
+    configured, or if the LLM path raises for ANY reason (missing key,
+    API error, rate limit, timeout) -- so a transient LLM issue never
+    breaks the app; the tested deterministic path is always the safety
+    net, not a discarded alternative.
+
+    No MCP subprocess indirection on this path either way -- a real MCP
     server/client pair still exists in app/mcp_server.py and
-    app/mcp_client.py, tested and available for an LLM-driven or
-    external-host integration later, but spawning/coordinating a
-    subprocess for every chat message proved too fragile on a
-    resource-constrained host and added a failure mode with no
-    corresponding benefit for a deterministic (non-LLM) router, which
-    never needed dynamic tool discovery in the first place."""
+    app/mcp_client.py, tested and available for an external-host
+    integration later, but spawning a subprocess per chat message proved
+    too fragile on a resource-constrained host."""
+    import app.llm_agent as llm_agent
+
+    if llm_agent.is_configured():
+        tier = check_entitlement(db, user_id)
+        if tier not in (None, "none"):
+            plan = get_latest_tax_plan(db, user_id)
+            if plan is not None:
+                try:
+                    history = get_conversation_history(db, conversation_id, limit=15)
+                    return llm_agent.run(db, user_id, conversation_id, tier, plan, message, history)
+                except Exception as exc:
+                    # Log, don't swallow silently -- a silent fallback here
+                    # previously meant the LLM path was failing on every
+                    # real question with no diagnostic trail at all.
+                    import logging
+                    logging.getLogger("app.agent").warning("LLM path failed, falling back to deterministic router: %r", exc)
+                    # fall through to the deterministic path below
+
     return _run_body(db, user_id, conversation_id, message)

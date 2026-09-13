@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
 import { api, Citation } from '../lib/api'
-import DocumentUpload from './DocumentUpload'
 
 type Message = {
   role: 'user' | 'assistant'
@@ -142,14 +141,29 @@ export default function ChatView({ pendingQuestion }: { pendingQuestion?: string
             ))}
           </ul>
         </div>
-        <DocumentUpload />
       </aside>
 
       {/* Chat column */}
       <main className="flex min-w-0 flex-1 flex-col">
-        <header className="mb-4">
-          <h1 className="font-serif text-2xl text-ledger-900">AGFinTax Coach</h1>
-          <p className="text-sm text-ledger-600">Answers are grounded in your plan and cited government sources.</p>
+        <header className="mb-4 flex items-start justify-between">
+          <div>
+            <h1 className="font-serif text-2xl text-ledger-900">AGFinTax Coach</h1>
+            <p className="text-sm text-ledger-600">Answers are grounded in your plan and cited government sources.</p>
+          </div>
+          <button
+            onClick={() => {
+              setMessages([
+                {
+                  role: 'assistant',
+                  content: "I'm your tax coach. Ask about your plan, a tax rule, or try a what-if scenario.",
+                },
+              ])
+              setConversationId(undefined)
+            }}
+            className="shrink-0 rounded-lg border border-ledger-200 px-3 py-1.5 text-xs font-medium text-ledger-700 hover:bg-ledger-50"
+          >
+            Start new conversation
+          </button>
         </header>
 
         <div className="flex-1 overflow-y-auto rounded-xl border border-ledger-200 bg-white p-5">

@@ -131,6 +131,37 @@ def _tavily_discover(query: str, include_domains: list[str], max_results: int = 
     return results
 
 
+# Shared with search_internal_knowledge's relevance logic -- external
+# results need the same floor, or Tavily can hand back a technically-real
+# but totally irrelevant page (e.g. a query about a specific deduction
+# returning an unrelated IRS phone-scam warning) and we'd present it as
+# if it answered the question. A real result is worse than an honest
+# "couldn't retrieve" when it's this unrelated -- it looks authoritative
+# but isn't.
+def _is_relevant(query: str, title: str, content: str) -> bool:
+    """A result counts as relevant if EITHER: the title itself contains a
+    real query term (titles are a strong, concise relevance signal even
+    when extracted body content is sparse), OR at least a third of the
+    query's significant terms appear across title+content combined. Two
+    paths rather than one fixed ratio, because a compound question
+    ("IRMAA thresholds AND FICA wage base") can be genuinely, correctly
+    answered by a source covering only part of it -- that's partial
+    coverage, not a bad match. This only needs to be strict enough to
+    reject a completely unrelated page (e.g. a phone-scam warning
+    returned for an "Augusta Rule" query), which is the actual failure
+    mode it exists to catch.
+    """
+    terms = [t for t in query.split() if len(t) > 2 and t.lower() not in _STOPWORDS]
+    if not terms:
+        return True  # nothing meaningful to check against; don't over-reject
+    title_lower = title.lower()
+    if any(t.lower() in title_lower for t in terms):
+        return True
+    haystack = f"{title} {content}".lower()
+    matched = sum(1 for t in terms if t.lower() in haystack)
+    return matched / len(terms) >= 1 / 3
+
+
 def search_official_sources(db: Session, scope_tags: list[str], tier: str, query: str | None = None) -> list[dict]:
     """Return real extracted page content from official sources, scoped
     to enabled source_registry domains matching scope/tier.
@@ -159,20 +190,24 @@ def search_official_sources(db: Session, scope_tags: list[str], tier: str, query
             results = []
             for d in discovered:
                 extracted = extract_page_content(d["url"])
+                content = extracted if extracted else d["tavily_snippet"]
+                if not _is_relevant(query, d["title"], content):
+                    continue  # discard -- real content, but not actually about the question asked
                 results.append(
                     {
                         "domain": d["domain"],
                         "title": d["title"],
                         "url": d["url"],
-                        "content": extracted if extracted else d["tavily_snippet"],
+                        "content": content,
                         "content_source": "extracted" if extracted else "tavily_snippet",
                     }
                 )
-            # PRD Section 6 (Audit): every official-source query must be
-            # logged with the query and the source URL(s) returned.
-            from app.audit import log_event
-            log_event(db, "official_source_query", payload={"query": query, "urls": [r["url"] for r in results]})
-            return results
+            if results:
+                # PRD Section 6 (Audit): every official-source query must be
+                # logged with the query and the source URL(s) returned.
+                from app.audit import log_event
+                log_event(db, "official_source_query", payload={"query": query, "urls": [r["url"] for r in results]})
+                return results
 
     # Fallback: registry metadata only, no live fetch (Tavily not
     # configured, no query given, or discovery returned nothing).
