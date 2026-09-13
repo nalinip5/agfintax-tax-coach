@@ -17,12 +17,25 @@ const INTENT_LABEL: Record<string, string> = {
 }
 
 function SourceCard({ citation }: { citation: Citation }) {
+  const pillClasses =
+    'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors'
+  if (!citation.url) {
+    // Internal reference (e.g. "your AGFinTax plan") -- not an external
+    // link, so render as a plain, non-clickable label rather than a
+    // dead link pointing nowhere.
+    return (
+      <span className={`${pillClasses} border-ledger-200 bg-ledger-50 text-ledger-600`}>
+        <span className="h-1.5 w-1.5 rounded-full bg-ledger-400" />
+        {citation.label}
+      </span>
+    )
+  }
   return (
     <a
       href={citation.url}
       target="_blank"
       rel="noreferrer"
-      className="inline-flex items-center gap-1.5 rounded-full border border-ledger-200 bg-white px-3 py-1 text-xs text-ledger-700 hover:border-clay-500 hover:text-clay-600 transition-colors"
+      className={`${pillClasses} border-ledger-200 bg-white text-ledger-700 hover:border-clay-500 hover:text-clay-600`}
     >
       <span className="h-1.5 w-1.5 rounded-full bg-clay-500" />
       {citation.label}

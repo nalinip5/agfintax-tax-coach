@@ -11,7 +11,7 @@ _LIFE_EVENT_PATTERNS = {
     "new_child_or_adoption": re.compile(r"\b(had a baby|new (baby|child)|adopt(ed|ion)|pregnant)\b", re.IGNORECASE),
     "home_purchase_or_sale": re.compile(r"\b(bought a house|home purchase|new mortgage|sold (my|our) house|home sale)\b", re.IGNORECASE),
     "job_change_or_new_employer": re.compile(r"\b(new job|laid off|lost my job|changed jobs|new employer|switching jobs)\b", re.IGNORECASE),
-    "starting_or_closing_business": re.compile(r"\b(started a business|starting a business|closing (my|the) business|closed my business|sold my business)\b", re.IGNORECASE),
+    "starting_or_closing_business": re.compile(r"\b(start(ed|ing)?\s+(a|my|the)(\s+\w+){0,2}\s+business|closing (my|the) business|closed my business|sold my business)\b", re.IGNORECASE),
     "retirement": re.compile(r"\b(retir(ed|ing|ement))\b", re.IGNORECASE),
     "inheritance": re.compile(r"\b(inherit(ed|ance)|received an inheritance)\b", re.IGNORECASE),
     "significant_income_change": re.compile(r"\b(income (doubled|dropped|increased|decreased)|big raise|pay cut|lost most of my income)\b", re.IGNORECASE),

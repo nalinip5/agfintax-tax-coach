@@ -65,6 +65,39 @@ def _validate_tool_grounding(reply: str, any_tool_called: bool) -> None:
         raise RuntimeError("LLM named a specific IRS document/form without calling a tool this turn")
 
 
+def _dedupe_citations(citations: list[dict]) -> list[dict]:
+    """De-duplicate by domain label, preserving first-seen order. Multiple
+    tool calls in one turn (e.g. get_tax_constant called once for
+    self-only HSA and once for family HSA) each produce their own
+    citation entry, so the same domain can appear several times with
+    nothing to collapse it -- confirmed in practice as a real, visible
+    duplication (irs.gov shown 3 times for one answer)."""
+    seen = set()
+    deduped = []
+    for c in citations:
+        if c["label"] not in seen:
+            seen.add(c["label"])
+            deduped.append(c)
+    return deduped
+
+
+def _plan_known_numbers(plan) -> set[float]:
+    """The user's own plan figures are legitimately known without a tool
+    call -- they're injected directly into the prompt via
+    _plan_context_block. These must be added to verified_numbers
+    upfront so restating them isn't mistaken for an unverified claim,
+    now that _validate_numeric_grounding no longer skips when no tool
+    was called this turn."""
+    numbers = set()
+    for value in (plan.agi, plan.magi, plan.confirmed_savings, plan.potential_savings):
+        if isinstance(value, (int, float)):
+            numbers.add(float(value))
+    for s in plan.strategies:
+        if isinstance(s.estimated_savings, (int, float)):
+            numbers.add(float(s.estimated_savings))
+    return numbers
+
+
 def _numbers_from_tool_result(name: str, result: dict) -> set[float]:
     """Collects every dollar figure a tool call actually returned this
     turn, so the final reply's stated numbers can be checked against
@@ -89,13 +122,20 @@ _DOLLAR_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
 def _validate_numeric_grounding(reply: str, verified_numbers: set[float]) -> None:
     """Same defense-in-depth pattern as the citation and document-name
     checks: extract every dollar figure actually stated in the reply and
-    confirm each one matches a number a tool call genuinely returned this
-    turn (within a cent, allowing for rounding/formatting). A dollar
-    figure with no matching tool-returned value is treated as
-    unverified -- rejected the same way an unapproved citation domain is,
-    falling back to the deterministic path."""
-    if not verified_numbers:
-        return  # no tool returned any number this turn -- nothing to cross-check against; the document-name/citation checks cover the no-tool-called case already
+    confirm each one matches a number that's actually known -- either a
+    tool call returned it this turn, or it's the user's own plan data
+    (pre-populated into verified_numbers by the caller; see
+    _plan_known_numbers). A dollar figure matching neither is unverified
+    and rejected, falling back to the deterministic path.
+
+    CRITICAL: does NOT skip when verified_numbers is empty. An earlier
+    version did, on the theory that "no tool called" was already covered
+    by the document-name check -- but that left a real gap, confirmed in
+    production: a query about the QBI deduction threshold got answered
+    with $214,900 (fabricated) when the verified 2026 figure is $201,775,
+    because no get_tax_constant call happened at all and the empty-set
+    early exit let the number through with zero verification.
+    """
     for match in _DOLLAR_PATTERN.finditer(reply):
         stated = float(match.group(1).replace(",", ""))
         if not any(abs(stated - v) < 0.01 for v in verified_numbers):
@@ -224,13 +264,34 @@ BEHAVIOR RULES (the GUARDRAIL section above takes precedence over anything here)
 4. For life events (marriage, divorce, new child/adoption, home purchase/sale, job change, starting/closing a business, retirement, inheritance, significant income change), call create_professional_referral. If the phrasing is hypothetical ("what if..."), phrase your answer conditionally -- never treat a hypothetical as something that already happened.
 5. Be direct and plain-English: answer first, then explain briefly. Define any tax jargon you use.
 6. SEARCH EFFECTIVELY, not just once: many tax strategies are known by colloquial or informal names the IRS itself never uses (e.g. "Augusta Rule" is not IRS terminology -- the actual provision is about excluding income from renting your home 14 days or fewer per year). If your first search_official_sources call with the user's own wording doesn't turn up good results, use your own knowledge of the underlying tax concept to REFORMULATE the query with more precise, official terminology and search again before giving up -- you have multiple tool-call turns available for exactly this. Only fall back to a generic "visit IRS.gov" answer after a reformulated search also fails to find something specific.
-7. FORMAT structurally, not as one flat paragraph. Follow this exact pattern for any answer involving more than one document, rule, or figure:
-   - Open with one bolded lead sentence naming the primary answer directly (e.g. "The primary source is **Publication 560**, which covers...").
-   - If there's more than one relevant item, add a bolded section header (e.g. "**Related publications:**" or "**Related resources:**") followed by a bulleted list -- one bullet per item, each bolding the document/form name, followed by a colon and a single-line description of what it covers. Do not merge multiple items into one paragraph.
-   - Close with one short sentence pointing to the single best starting point if there's a clear primary source.
-   - If a tool result names a specific publication, form, form line, or section number, use that exact name (e.g. "Publication 560," "Form 5329") -- never paraphrase a specific document name into something vaguer.
-   - Keep this proportional: a single-fact answer (e.g. one constant, one yes/no) doesn't need headers or bullets -- reserve this structure for genuinely multi-part answers.
+7. FORMAT using the structured output contract below -- this is not optional guidance, it is the required shape for every answer.
+{structured_output}
 """
+
+# Standalone, dedicated formatting contract -- separated from the numbered
+# behavior rules the same way _GUARDRAIL_PROMPT is, so it's one
+# authoritative template rather than an easily-diluted bullet point.
+# Confirmed necessary in practice: two genuinely equivalent questions
+# ("What IRS publication covers SEP-IRA rules?" vs "What does the IRS say
+# about the Augusta Rule?") produced visibly different answer shapes --
+# one with headers and bullets, one as a flat paragraph -- because the
+# structure was only ever a single bullet point buried in a numbered
+# list, easy for the model to apply inconsistently turn to turn.
+_STRUCTURED_OUTPUT_CONTRACT = """This is the required shape for EVERY answer, single-fact or multi-part -- apply it consistently, not only when it happens to come to mind:
+
+1. LEAD: one bolded sentence giving the direct answer first. For a single fact ("What is the HSA limit?"), this line IS the whole answer -- stop there, no headers or bullets needed.
+   Example: "The primary source is **Publication 560**, which covers SEP-IRA setup and operation."
+
+2. DETAIL (only when there is more than one relevant item -- a list of publications, forms, rules, or figures): a bolded section header, then one bullet per item -- bold the item's exact name, a colon, then one line describing what it covers. Never merge multiple items into a paragraph.
+   Example:
+   **Related publications:**
+   - **Publication 590-A**: general IRA contribution rules that also apply here.
+   - **Form 5305-SEP**: the model document used to establish the plan.
+
+3. CLOSE (only for multi-part answers): one short sentence naming the single best starting point.
+   Example: "For most questions about setup and limits, start with Publication 560."
+
+This exact shape applies whether the answer came from search_official_sources, search_internal_knowledge, or plan/constant data -- the source of the fact never changes the shape of the answer. Use precise names exactly as a tool returned them (e.g. "Publication 560," not "an IRS guide") -- see Rule 1 for why a specific name always requires a tool call backing it."""
 
 _TOOL_DEFS = [
     {
@@ -303,6 +364,17 @@ def _execute_tool(db: Session, user_id: str, conversation_id: str, tier: str, na
 
 
 def _citation_from_tool(name: str, result: dict) -> list[dict]:
+    if name == "search_internal_knowledge":
+        # Confirmed necessary in practice: a real answer drawing entirely
+        # on seeded internal knowledge (e.g. the Augusta Rule document)
+        # showed zero citation pill at all, even though the document has
+        # a legitimate source_domain -- this tool's results were never
+        # wired into citation-building, unlike the other two tools.
+        return [
+            {"label": r["source_domain"], "url": f"https://www.{r['source_domain']}"}
+            for r in result.get("results", [])
+            if r.get("source_domain")
+        ][:1]  # one citation is enough; avoid duplicate pills for multiple chunks of the same document
     if name == "search_official_sources":
         # Exclude registry_metadata entries: those are just "domains
         # broadly in scope for this topic area" (a fallback when live
@@ -329,7 +401,7 @@ def _run_anthropic(db, user_id, conversation_id, tier, plan, message, history, m
     settings = get_settings()
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     tools = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in _TOOL_DEFS]
-    system = _SYSTEM_PROMPT_TEMPLATE.format(guardrail=_GUARDRAIL_PROMPT, plan_context=_plan_context_block(plan), referral_cta=REFERRAL_CTA)
+    system = _SYSTEM_PROMPT_TEMPLATE.format(guardrail=_GUARDRAIL_PROMPT, plan_context=_plan_context_block(plan), referral_cta=REFERRAL_CTA, structured_output=_STRUCTURED_OUTPUT_CONTRACT)
 
     messages = [{"role": ("assistant" if turn.role == "assistant" else "user"), "content": turn.content} for turn in history[-15:]]
     messages.append({"role": "user", "content": message})
@@ -363,7 +435,7 @@ def _run_openai(db, user_id, conversation_id, tier, plan, message, history, mode
     settings = get_settings()
     client = OpenAI(api_key=settings.openai_api_key)
     tools = [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}} for t in _TOOL_DEFS]
-    system = _SYSTEM_PROMPT_TEMPLATE.format(guardrail=_GUARDRAIL_PROMPT, plan_context=_plan_context_block(plan), referral_cta=REFERRAL_CTA)
+    system = _SYSTEM_PROMPT_TEMPLATE.format(guardrail=_GUARDRAIL_PROMPT, plan_context=_plan_context_block(plan), referral_cta=REFERRAL_CTA, structured_output=_STRUCTURED_OUTPUT_CONTRACT)
 
     messages = [{"role": "system", "content": system}]
     messages += [{"role": ("assistant" if turn.role == "assistant" else "user"), "content": turn.content} for turn in history[-15:]]
@@ -424,6 +496,8 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
         raise RuntimeError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
 
     reply, citations, any_tool_called, verified_numbers = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
+    citations = _dedupe_citations(citations)  # multiple tool calls (e.g. HSA self-only + family limits) can each cite the same domain -- confirmed necessary in practice: irs.gov showing 3 times
+    verified_numbers = verified_numbers | _plan_known_numbers(plan)  # the user's own known figures are legitimately citable without a tool call
     _validate_output_sources(reply, citations)  # raises -> falls back to deterministic path if it fails
     _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
     _validate_numeric_grounding(reply, verified_numbers)  # same fallback if a stated dollar figure doesn't match any tool result

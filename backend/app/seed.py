@@ -153,6 +153,31 @@ if not db.query(Document).filter(Document.title == "The Augusta Rule (IRC Sectio
     db.flush()
     db.add(DocumentChunk(document_id=doc2.id, content=augusta_rule_summary))
 
+# --- SEP-IRA governing publications -- the exact question this covers
+# ("What IRS publication covers SEP-IRA rules?") was previously falling
+# through to a raw 400-character truncated extraction cut off mid-word.
+# Seeding real, structured content makes this reliably answerable. ---
+if not db.query(Document).filter(Document.title == "SEP-IRA Governing IRS Publications").first():
+    sep_ira_pubs_summary = (
+        "The primary IRS guide for SEP-IRA rules is Publication 560, Retirement Plans for Small "
+        "Business (SEP, SIMPLE, and Qualified Plans). It covers establishing and operating a SEP, "
+        "employer contribution and deduction rules, eligibility requirements, and the special "
+        "contribution calculation for self-employed individuals.\n\n"
+        "Related publications and forms:\n"
+        "- Publication 590-A, Contributions to Individual Retirement Arrangements (IRAs): general "
+        "IRA contribution rules that also apply to SEP-IRA accounts.\n"
+        "- Publication 590-B, Distributions from Individual Retirement Arrangements (IRAs): "
+        "withdrawals, rollovers, and required minimum distribution rules for SEP-IRAs.\n"
+        "- Form 5305-SEP: the IRS model document an employer can use to establish a basic SEP plan "
+        "without a separate, individually-designed plan document.\n\n"
+        "For most questions about SEP-IRA setup, contribution limits, and employer "
+        "responsibilities, Publication 560 is the right starting point."
+    )
+    doc3 = Document(title="SEP-IRA Governing IRS Publications", source_domain="irs.gov", published=True)
+    db.add(doc3)
+    db.flush()
+    db.add(DocumentChunk(document_id=doc3.id, content=sep_ira_pubs_summary))
+
 # --- PRD Section 5: the ONLY approved official sources. No other domain
 # may ever be added here -- see app/tools/knowledge.py's
 # APPROVED_SOURCE_DOMAINS, which is enforced independently of this seed. ---

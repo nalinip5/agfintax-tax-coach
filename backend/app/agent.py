@@ -32,6 +32,13 @@ from app.tools.conversation import detect_life_event, create_professional_referr
 
 REFERRAL_CTA = "Talk to our AGFinTax Tax Planner"
 
+# Honest reference for answers drawn purely from the user's own plan data,
+# not an external government source -- distinct from an irs.gov citation
+# (which would misattribute the source), but still gives every answer a
+# consistent, visible "where this came from" tag rather than some answers
+# having a reference and others having none for no principled reason.
+PLAN_DATA_CITATION = [{"label": "your AGFinTax plan"}]
+
 # --- PRD Section 7: explicitly out of scope, regardless of phrasing ---
 _OUT_OF_SCOPE = re.compile(
     r"\b(weather|sports score|recipe|write me a poem|"
@@ -209,7 +216,7 @@ def _lookup_intake_category(plan, message: str) -> str | None:
             parts.append(f"brokerage account value on file: ${re_data['brokerage_account_value']:,.0f}")
         return ", ".join(parts) + "."
 
-    if any(w in lowered for w in ["401k contribution", "retirement contribution", "how much am i contributing", "am i contributing"]):
+    if "limit" not in lowered and any(w in lowered for w in ["my 401k contribution", "my retirement contribution", "how much am i contributing", "am i contributing"]):
         rp = plan.retirement_planning or {}
         parts = []
         if rp.get("has_401k"):
@@ -301,6 +308,43 @@ def _scope_tags_for(message: str) -> list[str]:
     return tags
 
 
+def _dedupe_citations(citations: list[dict]) -> list[dict]:
+    """De-duplicate by domain label, preserving first-seen order --
+    multiple discovered pages on the same domain would otherwise each
+    produce their own identical-looking citation pill."""
+    seen = set()
+    deduped = []
+    for c in citations:
+        if c["label"] not in seen:
+            seen.add(c["label"])
+            deduped.append(c)
+    return deduped
+
+
+def _smart_truncate(content: str, limit: int = 400) -> str:
+    """Breaks at the last complete sentence within the limit rather than
+    mid-word/mid-sentence -- confirmed necessary in practice: a raw
+    truncation cut off at "See Pubs. 590..." mid-reference, reading as
+    broken rather than intentionally summarized."""
+    if len(content) <= limit:
+        return content
+    truncated = content[:limit]
+    last_period = truncated.rfind(". ")
+    return truncated[: last_period + 1] if last_period > limit // 2 else truncated + "..."
+
+
+def _sourced_answer(domain: str, content: str) -> str:
+    """ONE consistent lead-in for any answer grounded in a real source --
+    used by both internal-knowledge and external-source branches so a
+    user asking two different questions gets the same answer SHAPE, not
+    different-looking templates depending on which internal code path
+    happened to answer it. Confirmed necessary in practice: internal
+    answers said "From verified internal guidance:" while external ones
+    said "Here's what I found: According to X:" -- visibly inconsistent
+    for no functional reason."""
+    return f"According to {domain}: {content}"
+
+
 def _compose_from_sources(sources: list[dict], intro: str) -> tuple[str, list[dict]]:
     """PRD 4.4: every answer sourced from an official domain must include
     that source's URL so the user can verify it themselves. PRD 6
@@ -324,18 +368,18 @@ def _compose_from_sources(sources: list[dict], intro: str) -> tuple[str, list[di
             f"{intro} I wasn't able to retrieve specific guidance from an official source just now, "
             f"but {domains} would have the relevant rules -- you're welcome to check there directly, "
             f"or {REFERRAL_CTA} can look this up for you.",
-            [{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:3]],
+            _dedupe_citations([{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:3]]),
         )
 
     content = (top.get("content") or "").strip()
-    snippet = content[:400] + ("..." if len(content) > 400 else "") if content else top.get("title", "")
+    snippet = _smart_truncate(content) if content else top.get("title", "")
 
-    reply = f"{intro} According to {top['domain']}: {snippet}"
+    reply = _sourced_answer(top["domain"], snippet)
     if len(sources) > 1:
         others = ", ".join(s["domain"] for s in sources[1:3])
         reply += f"\n\nAlso worth checking: {others}."
 
-    citations = [{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:3]]
+    citations = _dedupe_citations([{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:3]])
     return reply, citations
 
 
@@ -525,7 +569,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
         elif sources:
             reply += f"I wasn't able to pull specific guidance just now -- you can review {sources[0]['domain']} directly for {label}-related rules.\n\n"
         reply += f"{REFERRAL_CTA} to update your plan for this change."
-        citations = [{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:2]]
+        citations = _dedupe_citations([{"label": s["domain"], "url": s.get("url") or f"https://www.{s['domain']}"} for s in sources[:2]])
         return {"reply": reply, "citations": citations}
 
     # --- What-if scenarios (PRD 4.6): grounded in verified constants AND
@@ -594,21 +638,21 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
             if s.title.lower() in message.lower():
                 return {
                     "reply": f"{s.title}: {s.why_it_applies or s.description} (Estimated savings: ${s.estimated_savings:,.0f}, status: {s.status}.)",
-                    "citations": [],
+                    "citations": PLAN_DATA_CITATION,
                 }
 
     # --- Direct plan-metric lookup (marginal rate, AGI, MAGI, filing
     # status): core session context, checked first. ---
     metric_answer = _lookup_plan_metric(plan, message)
     if metric_answer:
-        return {"reply": metric_answer, "citations": []}
+        return {"reply": metric_answer, "citations": PLAN_DATA_CITATION}
 
     # --- Direct intake-data lookup: this IS the user's own data (from the
     # 8-section intake), and more specific than the full-plan dump below --
     # checked first so "am I itemizing" doesn't just return the whole plan. ---
     intake_answer = _lookup_intake_category(plan, message)
     if intake_answer:
-        return {"reply": intake_answer, "citations": []}
+        return {"reply": intake_answer, "citations": PLAN_DATA_CITATION}
 
     if _PLAN_QUESTION.search(message):
         strategies_text = "\n".join(
@@ -618,7 +662,7 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
         reply = f"{_plan_summary(plan)}\n\nStrategies on your plan:\n{strategies_text}"
         if plan.urgent_observations:
             reply += "\n\nWorth your attention: " + "; ".join(plan.urgent_observations)
-        return {"reply": reply, "citations": []}
+        return {"reply": reply, "citations": PLAN_DATA_CITATION}
 
     # --- Direct IRS constant lookup (PRD 4.3) -- checked before any RAG
     # fallback, since these must be answered from the verified DB exactly. ---
@@ -631,9 +675,12 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
     internal_hits = search_internal_knowledge(db, message)
     if internal_hits:
         top = internal_hits[0]
-        content = top["content"][:400]
+        # No truncation here: internal documents are our own authored,
+        # curated content (kept intentionally concise), unlike unbounded
+        # external page extractions -- there's no need to cut them off.
+        content = top["content"]
         citations = [{"label": top["source_domain"], "url": f"https://www.{top['source_domain']}"}] if top.get("source_domain") else []
-        return {"reply": f"From verified internal guidance: {content}", "citations": citations}
+        return {"reply": _sourced_answer(top["source_domain"], content) if top.get("source_domain") else content, "citations": citations}
 
     sources = search_official_sources(db, scope_tags, tier, query=message)
     reply, citations = _compose_from_sources(sources, "Here's what I found:")
