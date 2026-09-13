@@ -14,6 +14,7 @@ Azure Document Intelligence. Adding a new government source is a DB
 insert; this function never changes when new sources are added.
 """
 from urllib.parse import urlparse
+import re
 
 import httpx
 from sqlalchemy import or_ as sa_or
@@ -208,6 +209,9 @@ def _tavily_discover(query: str, include_domains: list[str], max_results: int = 
 # if it answered the question. A real result is worse than an honest
 # "couldn't retrieve" when it's this unrelated -- it looks authoritative
 # but isn't.
+_PROPER_NOUN_PHRASE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
+
+
 def _is_relevant(query: str, title: str, content: str) -> bool:
     """A result counts as relevant if EITHER: the title itself contains a
     real query term (titles are a strong, concise relevance signal even
@@ -220,14 +224,31 @@ def _is_relevant(query: str, title: str, content: str) -> bool:
     reject a completely unrelated page (e.g. a phone-scam warning
     returned for an "Augusta Rule" query), which is the actual failure
     mode it exists to catch.
+
+    EXCEPTION for named-concept queries (e.g. "Augusta Rule"): a single
+    shared word is not enough. Confirmed necessary in practice -- a
+    congress.gov page about a representative named Hatcher passed the
+    single-term-title check purely because his district/bio happened to
+    mention "Augusta" (a place name), with zero actual connection to the
+    tax provision informally called the Augusta Rule. When the query
+    names a specific multi-word phrase, only the phrase itself appearing
+    together counts -- individual constituent words are too likely to
+    coincidentally appear elsewhere (place names, person names) to be a
+    reliable relevance signal on their own.
     """
     terms = [t for t in query.split() if len(t) > 2 and t.lower() not in _STOPWORDS]
     if not terms:
         return True  # nothing meaningful to check against; don't over-reject
+
+    haystack = f"{title} {content}".lower()
+
+    phrase_match = _PROPER_NOUN_PHRASE.search(query)
+    if phrase_match:
+        return phrase_match.group(1).lower() in haystack
+
     title_lower = title.lower()
     if any(t.lower() in title_lower for t in terms):
         return True
-    haystack = f"{title} {content}".lower()
     matched = sum(1 for t in terms if t.lower() in haystack)
     return matched / len(terms) >= 1 / 3
 
