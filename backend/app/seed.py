@@ -123,6 +123,36 @@ if not db.query(Document).filter(Document.title == "OBBBA Summary (One Big Beaut
     db.flush()
     db.add(DocumentChunk(document_id=doc.id, content=obbba_summary))
 
+# --- Augusta Rule (IRC Section 280A(g)) -- a commonly-asked colloquial
+# strategy name the IRS itself never uses, so live search frequently
+# fails to surface it well. Seeding real, verified content here means
+# the answer no longer depends on external search quality for this
+# specific, frequently-asked question. ---
+if not db.query(Document).filter(Document.title == "The Augusta Rule (IRC Section 280A(g))").first():
+    augusta_rule_summary = (
+        "The 'Augusta Rule' is a colloquial name -- not IRS terminology -- for the personal "
+        "residence rental exclusion under Internal Revenue Code Section 280A(g). It lets a "
+        "homeowner rent out a primary or secondary residence for up to 14 days per calendar year "
+        "without reporting that rental income as taxable, and without needing to file it on their "
+        "return at all.\n\n"
+        "Key conditions:\n"
+        "- The property must be used personally by the owner for more than 14 days, or more than "
+        "10% of the days it is rented at fair value, whichever is greater -- it must genuinely be a "
+        "personal residence, not a dedicated rental property.\n"
+        "- The 14-day limit is per calendar year, per property; renting for a 15th day makes ALL of "
+        "the rental income for that year taxable, not just the income beyond 14 days.\n"
+        "- Rent charged must be at a reasonable, fair-market rate for the area and circumstances.\n"
+        "- Because the income is excluded, none of the related rental expenses (cleaning, "
+        "utilities, depreciation for the rental period) are deductible either.\n\n"
+        "The name comes from the strategy's popularity among homeowners near the Masters "
+        "Tournament in Augusta, Georgia, who rent out their homes during that week -- but the "
+        "underlying rule applies nationwide to any residence, for any short-term rental reason."
+    )
+    doc2 = Document(title="The Augusta Rule (IRC Section 280A(g))", source_domain="irs.gov", published=True)
+    db.add(doc2)
+    db.flush()
+    db.add(DocumentChunk(document_id=doc2.id, content=augusta_rule_summary))
+
 # --- PRD Section 5: the ONLY approved official sources. No other domain
 # may ever be added here -- see app/tools/knowledge.py's
 # APPROVED_SOURCE_DOMAINS, which is enforced independently of this seed. ---

@@ -630,8 +630,10 @@ def _run_body(db: Session, user_id: str, conversation_id: str, message: str) -> 
     # --- Default: internal knowledge first, then live official sources. ---
     internal_hits = search_internal_knowledge(db, message)
     if internal_hits:
-        content = internal_hits[0]["content"][:400]
-        return {"reply": f"From verified internal guidance: {content}", "citations": []}
+        top = internal_hits[0]
+        content = top["content"][:400]
+        citations = [{"label": top["source_domain"], "url": f"https://www.{top['source_domain']}"}] if top.get("source_domain") else []
+        return {"reply": f"From verified internal guidance: {content}", "citations": citations}
 
     sources = search_official_sources(db, scope_tags, tier, query=message)
     reply, citations = _compose_from_sources(sources, "Here's what I found:")
