@@ -142,6 +142,9 @@ def _validate_numeric_grounding(reply: str, verified_numbers: set[float]) -> Non
             raise RuntimeError(f"LLM stated ${stated:,.2f} which doesn't match any tool-returned figure this turn: {verified_numbers}")
 
 
+PLAN_DATA_LABEL = "your AGFinTax plan"  # internal reference, not a government domain -- must be exempted from the domain-approval check below
+
+
 def _validate_output_sources(reply: str, citations: list[dict]) -> None:
     """Output-side guardrail, symmetric to the input-side PII check: no
     matter what the LLM was told to do, verify what it actually produced.
@@ -152,14 +155,25 @@ def _validate_output_sources(reply: str, citations: list[dict]) -> None:
     citations array still contained adp.com and en.wikipedia.org, which
     a text-only check would have missed entirely. app.agent.run()'s
     existing fallback mechanism routes to the deterministic path if this
-    raises, the same way it handles any other LLM-path failure."""
+    raises, the same way it handles any other LLM-path failure.
+
+    PLAN_DATA_LABEL is explicitly exempted here -- confirmed necessary in
+    practice: adding the internal "your AGFinTax plan" citation caused
+    THIS SAME validator to reject it as an "unapproved domain" (since
+    it's obviously not a .gov domain), silently killing every LLM answer
+    that included a plan figure and falling back to the deterministic
+    path on every single request -- a self-inflicted regression from the
+    previous round's fix, only caught by checking the actual server logs
+    rather than assuming the fix worked because a citation appeared."""
     for match in _URL_PATTERN.finditer(reply):
         domain = match.group(1).lower().removeprefix("www.")
         if domain not in APPROVED_SOURCE_DOMAINS:
             raise RuntimeError(f"LLM output text cited an unapproved domain: {domain}")
     for citation in citations:
-        label = citation.get("label", "").lower().removeprefix("www.")
-        if label not in APPROVED_SOURCE_DOMAINS:
+        label = citation.get("label", "")
+        if label == PLAN_DATA_LABEL:
+            continue
+        if label.lower().removeprefix("www.") not in APPROVED_SOURCE_DOMAINS:
             raise RuntimeError(f"LLM output citations list included an unapproved domain: {label}")
 
 # Standalone, non-negotiable guardrail block -- deliberately separated
@@ -510,7 +524,7 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
         # would incorrectly tag a decline or referral message too.
         plan_numbers = _plan_known_numbers(plan)
         if any(f"{v:,.0f}" in reply or f"{v:,.2f}" in reply for v in plan_numbers):
-            citations = [{"label": "your AGFinTax plan"}]
+            citations = [{"label": PLAN_DATA_LABEL}]
     _validate_output_sources(reply, citations)  # raises -> falls back to deterministic path if it fails
     _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
     _validate_numeric_grounding(reply, verified_numbers)  # same fallback if a stated dollar figure doesn't match any tool result
