@@ -498,6 +498,19 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
     reply, citations, any_tool_called, verified_numbers = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
     citations = _dedupe_citations(citations)  # multiple tool calls (e.g. HSA self-only + family limits) can each cite the same domain -- confirmed necessary in practice: irs.gov showing 3 times
     verified_numbers = verified_numbers | _plan_known_numbers(plan)  # the user's own known figures are legitimately citable without a tool call
+
+    if not citations:
+        # Confirmed necessary in practice: "what is on my plan" answered
+        # entirely from the injected plan context (no tool call needed)
+        # came back with zero citations, unlike the deterministic path's
+        # equivalent answer, which correctly shows "your AGFinTax plan".
+        # Only attach it here when a genuine plan figure is actually
+        # present in the text -- real evidence the answer drew on plan
+        # data -- rather than a blanket "no tool called" assumption that
+        # would incorrectly tag a decline or referral message too.
+        plan_numbers = _plan_known_numbers(plan)
+        if any(f"{v:,.0f}" in reply or f"{v:,.2f}" in reply for v in plan_numbers):
+            citations = [{"label": "your AGFinTax plan"}]
     _validate_output_sources(reply, citations)  # raises -> falls back to deterministic path if it fails
     _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
     _validate_numeric_grounding(reply, verified_numbers)  # same fallback if a stated dollar figure doesn't match any tool result
