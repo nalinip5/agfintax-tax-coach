@@ -48,10 +48,47 @@ _STOPWORDS = {
 }
 
 
+# Lightweight semantic matching -- NOT true embedding-based semantic
+# search (deliberately avoided: a local embedding model is a heavy
+# dependency, and we already hit a real reliability failure once from
+# adding weight to this app's request path -- see app/mcp_bridge.py's
+# history). This is simple term normalization plus a small curated
+# synonym set for common tax vocabulary, so a query using a different
+# but equivalent word/form than the source document can still match.
+_SYNONYMS = {
+    "sep-ira": ["sep", "sep ira", "simplified employee pension"],
+    "hsa": ["health savings account"],
+    "deduction": ["deduct", "deductible", "deducting"],
+    "contribution": ["contribute", "contributing", "contributed"],
+    "withholding": ["withhold", "withheld"],
+    "credit": ["credits"],
+    "ira": ["individual retirement"],
+}
+
+
+def _expand_term(term: str) -> list[str]:
+    """A term plus its simple stem (trailing s/es/ing/ed stripped, if the
+    remaining stem is still meaningful) plus any curated synonyms --
+    every variant a query term could reasonably match against."""
+    lowered = term.lower()
+    variants = {lowered}
+    for suffix in ("ing", "ed", "es", "s"):
+        if lowered.endswith(suffix) and len(lowered) - len(suffix) >= 3:
+            variants.add(lowered[: -len(suffix)])
+            break
+    for key, synonyms in _SYNONYMS.items():
+        if lowered == key or lowered in synonyms:
+            variants.add(key)
+            variants.update(synonyms)
+    return list(variants)
+
+
 def search_internal_knowledge(db: Session, query: str, limit: int = 5) -> list[dict]:
-    """Keyword OR-match across query terms, ranked by number of terms hit.
-    Suitable for SQLite/dev. On Postgres, swap for a pgvector similarity
-    search / tsvector full-text query -- callers don't need to change.
+    """Keyword OR-match across query terms (plus simple stemming and a
+    small curated tax-vocabulary synonym set -- see _expand_term), ranked
+    by number of terms hit. Suitable for SQLite/dev. On Postgres, swap
+    for a pgvector similarity search / tsvector full-text query --
+    callers don't need to change.
 
     Requires a meaningful fraction of SIGNIFICANT (non-stopword) query
     terms to actually match -- a document must not be presented as
@@ -64,17 +101,21 @@ def search_internal_knowledge(db: Session, query: str, limit: int = 5) -> list[d
     if not significant_terms:
         return []
 
+    term_variants = {t: _expand_term(t) for t in significant_terms}
+    all_variants = [v for variants in term_variants.values() for v in variants]
+
     rows = (
         db.query(DocumentChunk)
         .join(Document)
         .filter(Document.published.is_(True))
-        .filter(sa_or(*[DocumentChunk.content.ilike(f"%{t}%") for t in significant_terms]))
+        .filter(sa_or(*[DocumentChunk.content.ilike(f"%{v}%") for v in all_variants]))
         .all()
     )
 
     def score(chunk: DocumentChunk) -> float:
         text = chunk.content.lower()
-        return sum(1 for t in significant_terms if t.lower() in text) / len(significant_terms)
+        matched = sum(1 for t, variants in term_variants.items() if any(v in text for v in variants))
+        return matched / len(significant_terms)
 
     # Require at least half of the significant query terms to genuinely
     # appear in the chunk -- filters out documents that only coincidentally
@@ -100,6 +141,23 @@ def _matching_registry_rows(db: Session, scope_tags: list[str], tier: str) -> li
         return tags_ok and tier_ok
 
     return [r for r in rows if matches(r)]
+
+
+def _authority_tier(title: str, url: str) -> int:
+    """Real authority scoring (deterministic, no ML/embedding dependency --
+    a heavy local embedding model would risk the same resource-constraint
+    failure that per-message MCP subprocess spawning caused on Render's
+    free tier). Ranks 1 (highest, primary regulatory text) to 3 (lowest,
+    press releases and historical notices) so a page like "IRS Repeats
+    Warning about Phone Scams" -- a real .gov page, but a press release,
+    not guidance -- is deprioritized under a genuine Publication or
+    topic-overview page on the same domain."""
+    text = f"{title} {url}".lower()
+    if any(t in text for t in ["publication ", "/publications/", "form ", "instructions for", "revenue ruling", "revenue procedure", "treasury regulation", "26 cfr", "26 u.s.c"]):
+        return 1
+    if "/newsroom/" in text or "historical content" in text or "press release" in text or "news release" in text:
+        return 3
+    return 2
 
 
 def _tavily_discover(query: str, include_domains: list[str], max_results: int = 4) -> list[dict]:
@@ -128,7 +186,18 @@ def _tavily_discover(query: str, include_domains: list[str], max_results: int = 
     results = []
     for r in data.get("results", []):
         domain = urlparse(r.get("url", "")).netloc.removeprefix("www.")
-        results.append({"domain": domain, "title": r.get("title", ""), "url": r.get("url", ""), "tavily_snippet": r.get("content", "")[:500]})
+        # Hard policy floor, enforced here regardless of whether Tavily's
+        # own include_domains restriction actually held -- an external
+        # search API is not a trusted enforcement boundary by itself.
+        # Confirmed necessary in practice: a real query returned adp.com
+        # and en.wikipedia.org despite include_domains being set to only
+        # approved government domains.
+        if domain not in APPROVED_SOURCE_DOMAINS:
+            continue
+        title = r.get("title", "")
+        url = r.get("url", "")
+        results.append({"domain": domain, "title": title, "url": url, "tavily_snippet": r.get("content", "")[:500], "authority_tier": _authority_tier(title, url)})
+    results.sort(key=lambda r: r["authority_tier"])  # tier 1 (highest authority) first
     return results
 
 
@@ -201,6 +270,7 @@ def search_official_sources(db: Session, scope_tags: list[str], tier: str, query
                         "url": d["url"],
                         "content": content,
                         "content_source": "extracted" if extracted else "tavily_snippet",
+                        "authority_tier": d["authority_tier"],
                     }
                 )
             if results:

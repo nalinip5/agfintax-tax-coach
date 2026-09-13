@@ -65,22 +65,62 @@ def _validate_tool_grounding(reply: str, any_tool_called: bool) -> None:
         raise RuntimeError("LLM named a specific IRS document/form without calling a tool this turn")
 
 
-def _validate_output_sources(reply: str) -> None:
+def _numbers_from_tool_result(name: str, result: dict) -> set[float]:
+    """Collects every dollar figure a tool call actually returned this
+    turn, so the final reply's stated numbers can be checked against
+    them -- catching the case where the model calls the right tool, gets
+    a real number back, but then writes a DIFFERENT number in the prose
+    (transcription drift, not just outright invention -- a distinct
+    failure mode from the citation/document-name issues already caught,
+    and one that hasn't been tested yet)."""
+    numbers: set[float] = set()
+    if name == "get_tax_constant" and isinstance(result.get("value"), (int, float)):
+        numbers.add(float(result["value"]))
+    if name == "calculate_tax_scenario":
+        for key in ("estimated_federal_tax", "income", "effective_rate"):
+            if isinstance(result.get(key), (int, float)):
+                numbers.add(float(result[key]))
+    return numbers
+
+
+_DOLLAR_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
+
+
+def _validate_numeric_grounding(reply: str, verified_numbers: set[float]) -> None:
+    """Same defense-in-depth pattern as the citation and document-name
+    checks: extract every dollar figure actually stated in the reply and
+    confirm each one matches a number a tool call genuinely returned this
+    turn (within a cent, allowing for rounding/formatting). A dollar
+    figure with no matching tool-returned value is treated as
+    unverified -- rejected the same way an unapproved citation domain is,
+    falling back to the deterministic path."""
+    if not verified_numbers:
+        return  # no tool returned any number this turn -- nothing to cross-check against; the document-name/citation checks cover the no-tool-called case already
+    for match in _DOLLAR_PATTERN.finditer(reply):
+        stated = float(match.group(1).replace(",", ""))
+        if not any(abs(stated - v) < 0.01 for v in verified_numbers):
+            raise RuntimeError(f"LLM stated ${stated:,.2f} which doesn't match any tool-returned figure this turn: {verified_numbers}")
+
+
+def _validate_output_sources(reply: str, citations: list[dict]) -> None:
     """Output-side guardrail, symmetric to the input-side PII check: no
     matter what the LLM was told to do, verify what it actually produced.
-    An LLM can ignore or partially follow a system prompt instruction --
-    observed in practice: a model correctly citing irs.gov and dol.gov
-    while ALSO fabricating additional citations to adp.com and
-    en.wikipedia.org from its own training knowledge, despite an explicit
-    instruction never to cite anything a tool didn't return. Scans every
-    URL actually present in the final reply text and raises if any domain
-    isn't on the approved list -- app.agent.run()'s existing fallback
-    mechanism then routes to the deterministic path instead, the same way
-    it already handles any other LLM-path failure."""
+    Checks TWO separate data paths -- both the reply TEXT (in case the
+    model writes an inline markdown link) and the structured `citations`
+    list (built from tool results) -- confirmed necessary in practice:
+    a real reply had clean text with no embedded links, but its separate
+    citations array still contained adp.com and en.wikipedia.org, which
+    a text-only check would have missed entirely. app.agent.run()'s
+    existing fallback mechanism routes to the deterministic path if this
+    raises, the same way it handles any other LLM-path failure."""
     for match in _URL_PATTERN.finditer(reply):
         domain = match.group(1).lower().removeprefix("www.")
         if domain not in APPROVED_SOURCE_DOMAINS:
-            raise RuntimeError(f"LLM output cited an unapproved domain: {domain}")
+            raise RuntimeError(f"LLM output text cited an unapproved domain: {domain}")
+    for citation in citations:
+        label = citation.get("label", "").lower().removeprefix("www.")
+        if label not in APPROVED_SOURCE_DOMAINS:
+            raise RuntimeError(f"LLM output citations list included an unapproved domain: {label}")
 
 # Standalone, non-negotiable guardrail block -- deliberately separated
 # from general behavior instructions so it can be reasoned about (and
@@ -282,23 +322,25 @@ def _run_anthropic(db, user_id, conversation_id, tier, plan, message, history, m
 
     citations: list[dict] = []
     any_tool_called = False
+    verified_numbers: set[float] = set()
     for _ in range(MAX_TOOL_TURNS):
         resp = client.messages.create(model=model, max_tokens=max_tokens, system=system, tools=tools, messages=messages)
         messages.append({"role": "assistant", "content": resp.content})
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
             text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
-            return text, citations, any_tool_called
+            return text, citations, any_tool_called, verified_numbers
 
         any_tool_called = True
         tool_results = []
         for tu in tool_uses:
             result = _execute_tool(db, user_id, conversation_id, tier, tu.name, tu.input)
             citations.extend(_citation_from_tool(tu.name, result))
+            verified_numbers.update(_numbers_from_tool_result(tu.name, result))
             tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(result, default=str)})
         messages.append({"role": "user", "content": tool_results})
 
-    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called
+    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called, verified_numbers
 
 
 def _run_openai(db, user_id, conversation_id, tier, plan, message, history, model, max_tokens):
@@ -315,6 +357,7 @@ def _run_openai(db, user_id, conversation_id, tier, plan, message, history, mode
 
     citations: list[dict] = []
     any_tool_called = False
+    verified_numbers: set[float] = set()
     for _ in range(MAX_TOOL_TURNS):
         resp = client.chat.completions.create(model=model, max_tokens=max_tokens, tools=tools, messages=messages)
         msg = resp.choices[0].message
@@ -332,16 +375,17 @@ def _run_openai(db, user_id, conversation_id, tier, plan, message, history, mode
         messages.append(assistant_entry)
 
         if not msg.tool_calls:
-            return (msg.content or "").strip(), citations, any_tool_called
+            return (msg.content or "").strip(), citations, any_tool_called, verified_numbers
 
         any_tool_called = True
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
             result = _execute_tool(db, user_id, conversation_id, tier, tc.function.name, args)
             citations.extend(_citation_from_tool(tc.function.name, result))
+            verified_numbers.update(_numbers_from_tool_result(tc.function.name, result))
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)})
 
-    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called
+    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called, verified_numbers
 
 
 _RUNNERS = {"anthropic": _run_anthropic, "openai": _run_openai}
@@ -365,7 +409,8 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
     if runner is None:
         raise RuntimeError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
 
-    reply, citations, any_tool_called = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
-    _validate_output_sources(reply)  # raises -> falls back to deterministic path if it fails
+    reply, citations, any_tool_called, verified_numbers = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
+    _validate_output_sources(reply, citations)  # raises -> falls back to deterministic path if it fails
     _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
+    _validate_numeric_grounding(reply, verified_numbers)  # same fallback if a stated dollar figure doesn't match any tool result
     return {"reply": reply, "citations": citations}
