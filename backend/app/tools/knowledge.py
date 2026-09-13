@@ -37,6 +37,7 @@ APPROVED_SOURCE_DOMAINS = frozenset({
     "dol.gov",
     "pbgc.gov",
     "sec.gov",
+    "congress.gov",
 })
 
 

@@ -33,17 +33,54 @@ SECURITY -- financial/PII data never reaches the LLM or gets stored via it:
      module does not introduce a second storage path.
 """
 import json
+import re
 
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.guardrail import check_pii
-from app.tools.knowledge import search_internal_knowledge, search_official_sources
+from app.tools.knowledge import search_internal_knowledge, search_official_sources, APPROVED_SOURCE_DOMAINS
 from app.tools.tax_calc import get_tax_constant, calculate_tax_scenario
 from app.tools.conversation import create_professional_referral
 
 REFERRAL_CTA = "Talk to our AGFinTax Tax Planner"
 MAX_TOOL_TURNS = 5
+
+_URL_PATTERN = re.compile(r"https?://([a-zA-Z0-9.-]+)")
+
+
+_DOCUMENT_REFERENCE_PATTERN = re.compile(r"\b(publication|pub\.?|form|schedule)\s*\d+", re.IGNORECASE)
+
+
+def _validate_tool_grounding(reply: str, any_tool_called: bool) -> None:
+    """Rule 1 says specific publication/form numbers must come from a
+    tool call this turn -- prompt instructions alone weren't sufficient
+    for the citation-domain issue, so apply the same defense-in-depth
+    pattern here: if the reply names a specific IRS document (e.g.
+    'Publication 560', 'Form 5305-SEP') but no tool was actually called
+    this turn, that name almost certainly came from the model's training
+    memory, not a verified retrieval this turn -- reject it the same way
+    an unapproved citation domain gets rejected."""
+    if not any_tool_called and _DOCUMENT_REFERENCE_PATTERN.search(reply):
+        raise RuntimeError("LLM named a specific IRS document/form without calling a tool this turn")
+
+
+def _validate_output_sources(reply: str) -> None:
+    """Output-side guardrail, symmetric to the input-side PII check: no
+    matter what the LLM was told to do, verify what it actually produced.
+    An LLM can ignore or partially follow a system prompt instruction --
+    observed in practice: a model correctly citing irs.gov and dol.gov
+    while ALSO fabricating additional citations to adp.com and
+    en.wikipedia.org from its own training knowledge, despite an explicit
+    instruction never to cite anything a tool didn't return. Scans every
+    URL actually present in the final reply text and raises if any domain
+    isn't on the approved list -- app.agent.run()'s existing fallback
+    mechanism then routes to the deterministic path instead, the same way
+    it already handles any other LLM-path failure."""
+    for match in _URL_PATTERN.finditer(reply):
+        domain = match.group(1).lower().removeprefix("www.")
+        if domain not in APPROVED_SOURCE_DOMAINS:
+            raise RuntimeError(f"LLM output cited an unapproved domain: {domain}")
 
 # Standalone, non-negotiable guardrail block -- deliberately separated
 # from general behavior instructions so it can be reasoned about (and
@@ -141,17 +178,17 @@ The user's current plan context (already loaded -- never ask them to repeat any 
 {plan_context}
 
 BEHAVIOR RULES (the GUARDRAIL section above takes precedence over anything here):
-1. NEVER state a specific dollar figure, tax rate, deduction limit, or IRS rule from memory or estimation. Every specific number about an IRS-defined constant or official rule MUST come from a tool call made THIS turn (get_tax_constant, calculate_tax_scenario, search_official_sources, or search_internal_knowledge). If no tool call supports a number, say plainly "I don't have a verified figure for that" instead of guessing.
+1. NEVER state a specific dollar figure, tax rate, deduction limit, IRS publication/form number, or official rule from memory or estimation -- even if you are confident it is correct. Every such specific fact -- a number, a publication number (e.g. "Publication 560"), a form number (e.g. "Form 5305-SEP"), or a description of what a specific rule requires -- MUST come from a tool call made THIS turn (get_tax_constant, calculate_tax_scenario, search_official_sources, or search_internal_knowledge). This applies even to well-known, stable facts: call the tool anyway, so the answer is verified this turn rather than merely likely correct. If no tool call supports the fact, say plainly "I don't have a verified answer for that" instead of stating it from memory.
 2. Every claim sourced from search_official_sources or search_internal_knowledge must be cited by domain. Never fabricate a citation URL -- only use one a tool call actually returned.
 3. NEVER make an election or strategy recommendation ("you should do X"). Explain how a strategy works and calculate its impact; for any request to decide, recommend, or elect/skip a strategy, call create_professional_referral and respond with: "{referral_cta}".
 4. For life events (marriage, divorce, new child/adoption, home purchase/sale, job change, starting/closing a business, retirement, inheritance, significant income change), call create_professional_referral. If the phrasing is hypothetical ("what if..."), phrase your answer conditionally -- never treat a hypothetical as something that already happened.
 5. Be direct and plain-English: answer first, then explain briefly. Define any tax jargon you use.
-6. FORMAT structurally, not as one flat paragraph:
-   - Lead with a direct one- or two-sentence answer.
-   - If a tool result names specific publications, forms, form line numbers, or section numbers, name them explicitly and precisely (e.g. "Publication 560" or "Form 5329") -- don't paraphrase a specific document name into something vaguer.
-   - When there is more than one relevant document, rule, or figure, use a short bulleted list -- one bullet per item, each with a brief one-line description of what it covers.
-   - When multiple tool results overlap, distinguish them briefly rather than merging into one undifferentiated block of text.
-   - Keep the structure proportional: a single-fact answer (e.g. one constant) doesn't need bullets; a multi-part answer does.
+6. FORMAT structurally, not as one flat paragraph. Follow this exact pattern for any answer involving more than one document, rule, or figure:
+   - Open with one bolded lead sentence naming the primary answer directly (e.g. "The primary source is **Publication 560**, which covers...").
+   - If there's more than one relevant item, add a bolded section header (e.g. "**Related publications:**" or "**Related resources:**") followed by a bulleted list -- one bullet per item, each bolding the document/form name, followed by a colon and a single-line description of what it covers. Do not merge multiple items into one paragraph.
+   - Close with one short sentence pointing to the single best starting point if there's a clear primary source.
+   - If a tool result names a specific publication, form, form line, or section number, use that exact name (e.g. "Publication 560," "Form 5329") -- never paraphrase a specific document name into something vaguer.
+   - Keep this proportional: a single-fact answer (e.g. one constant, one yes/no) doesn't need headers or bullets -- reserve this structure for genuinely multi-part answers.
 """
 
 _TOOL_DEFS = [
@@ -244,14 +281,16 @@ def _run_anthropic(db, user_id, conversation_id, tier, plan, message, history, m
     messages.append({"role": "user", "content": message})
 
     citations: list[dict] = []
+    any_tool_called = False
     for _ in range(MAX_TOOL_TURNS):
         resp = client.messages.create(model=model, max_tokens=max_tokens, system=system, tools=tools, messages=messages)
         messages.append({"role": "assistant", "content": resp.content})
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
             text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
-            return text, citations
+            return text, citations, any_tool_called
 
+        any_tool_called = True
         tool_results = []
         for tu in tool_uses:
             result = _execute_tool(db, user_id, conversation_id, tier, tu.name, tu.input)
@@ -259,7 +298,7 @@ def _run_anthropic(db, user_id, conversation_id, tier, plan, message, history, m
             tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(result, default=str)})
         messages.append({"role": "user", "content": tool_results})
 
-    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations
+    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called
 
 
 def _run_openai(db, user_id, conversation_id, tier, plan, message, history, model, max_tokens):
@@ -275,6 +314,7 @@ def _run_openai(db, user_id, conversation_id, tier, plan, message, history, mode
     messages.append({"role": "user", "content": message})
 
     citations: list[dict] = []
+    any_tool_called = False
     for _ in range(MAX_TOOL_TURNS):
         resp = client.chat.completions.create(model=model, max_tokens=max_tokens, tools=tools, messages=messages)
         msg = resp.choices[0].message
@@ -292,15 +332,16 @@ def _run_openai(db, user_id, conversation_id, tier, plan, message, history, mode
         messages.append(assistant_entry)
 
         if not msg.tool_calls:
-            return (msg.content or "").strip(), citations
+            return (msg.content or "").strip(), citations, any_tool_called
 
+        any_tool_called = True
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
             result = _execute_tool(db, user_id, conversation_id, tier, tc.function.name, args)
             citations.extend(_citation_from_tool(tc.function.name, result))
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)})
 
-    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations
+    return "I wasn't able to fully resolve that within the allotted tool calls -- could you rephrase or narrow the question?", citations, any_tool_called
 
 
 _RUNNERS = {"anthropic": _run_anthropic, "openai": _run_openai}
@@ -324,5 +365,7 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
     if runner is None:
         raise RuntimeError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
 
-    reply, citations = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
+    reply, citations, any_tool_called = runner(db, user_id, conversation_id, tier, plan, message, history, settings.llm_model, settings.llm_max_tokens)
+    _validate_output_sources(reply)  # raises -> falls back to deterministic path if it fails
+    _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
     return {"reply": reply, "citations": citations}

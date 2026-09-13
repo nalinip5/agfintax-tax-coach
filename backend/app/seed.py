@@ -134,6 +134,7 @@ _default_sources = [
     dict(domain="dol.gov", description="401k, 403b, and ERISA contribution limits and rules", scope_tags=["retirement", "business"], api_method="tavily_search", enabled=True, tier=["plus", "pro"]),
     dict(domain="pbgc.gov", description="Defined benefit pension plan rules and premium rates", scope_tags=["retirement"], api_method="tavily_search", enabled=True, tier=["pro"]),
     dict(domain="sec.gov", description="Accredited investor definitions -- high-net-worth strategies only", scope_tags=["business"], api_method="tavily_search", enabled=True, tier=["pro"]),
+    dict(domain="congress.gov", description="Federal legislation text, bill status, and Congressional Research Service reports", scope_tags=["legislation", "general"], api_method="tavily_search", enabled=True, tier=["plus", "pro"]),
 ]
 for src in _default_sources:
     if not db.query(SourceRegistry).filter(SourceRegistry.domain == src["domain"]).first():
