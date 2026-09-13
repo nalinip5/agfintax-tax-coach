@@ -304,7 +304,20 @@ def _execute_tool(db: Session, user_id: str, conversation_id: str, tier: str, na
 
 def _citation_from_tool(name: str, result: dict) -> list[dict]:
     if name == "search_official_sources":
-        return [{"label": r["domain"], "url": r.get("url") or f"https://www.{r['domain']}"} for r in result.get("results", [])]
+        # Exclude registry_metadata entries: those are just "domains
+        # broadly in scope for this topic area" (a fallback when live
+        # discovery found nothing), not sources that actually support
+        # THIS answer -- confirmed necessary in practice: a search that
+        # found nothing specific to "Augusta Rule" still produced 5
+        # citation pills (irs.gov, treasury.gov, ssa.gov, cms.gov,
+        # congress.gov) even though the reply only ever mentioned
+        # irs.gov, because every in-scope domain got listed as if it
+        # were a verified source.
+        return [
+            {"label": r["domain"], "url": r.get("url") or f"https://www.{r['domain']}"}
+            for r in result.get("results", [])
+            if r.get("content_source") != "registry_metadata"
+        ]
     if name == "get_tax_constant" and result.get("source"):
         return [{"label": result["source"], "url": f"https://www.{result['source']}"}]
     return []
