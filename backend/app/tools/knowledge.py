@@ -160,11 +160,15 @@ def _authority_tier(title: str, url: str) -> int:
     a heavy local embedding model would risk the same resource-constraint
     failure that per-message MCP subprocess spawning caused on Render's
     free tier). Ranks 1 (highest, primary regulatory text) to 3 (lowest,
-    press releases and historical notices) so a page like "IRS Repeats
-    Warning about Phone Scams" -- a real .gov page, but a press release,
-    not guidance -- is deprioritized under a genuine Publication or
-    topic-overview page on the same domain."""
+    press releases, historical notices, and prior-year archived
+    publications) so a page like "IRS Repeats Warning about Phone Scams"
+    -- a real .gov page, but a press release, not guidance -- or a stale
+    "irs-prior/p560--2023.pdf" (confirmed in practice: linked as THE
+    answer for a 2026 question, an outdated prior-year publication) is
+    deprioritized under a genuine current-year Publication or topic page."""
     text = f"{title} {url}".lower()
+    if "/irs-prior/" in text or "prior year" in text:
+        return 3  # explicitly an archived prior-year document -- IRS's own URL convention for this
     if any(t in text for t in ["publication ", "/publications/", "form ", "instructions for", "revenue ruling", "revenue procedure", "treasury regulation", "26 cfr", "26 u.s.c"]):
         return 1
     if "/newsroom/" in text or "historical content" in text or "press release" in text or "news release" in text:

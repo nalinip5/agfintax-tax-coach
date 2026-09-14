@@ -145,6 +145,40 @@ def _validate_numeric_grounding(reply: str, verified_numbers: set[float]) -> Non
 PLAN_DATA_LABEL = "your AGFinTax plan"  # internal reference, not a government domain -- must be exempted from the domain-approval check below
 
 
+_REGISTRY_DESCRIPTION_FRAGMENTS = [
+    "federal tax law, publications, forms, instructions, and tax constants",
+    "treasury regulations, proposed rules, and final rules",
+    "social security wage base and fica contribution limits",
+    "irmaa income thresholds and medicare premium surcharges",
+    "401k, 403b, and erisa contribution limits and rules",
+    "defined benefit pension plan rules and premium rates",
+    "accredited investor definitions",
+    "federal legislation text, bill status, and congressional research service reports",
+]
+
+
+def _validate_not_registry_regurgitation(reply: str) -> None:
+    """Defense-in-depth, same pattern as the other output validators: the
+    tool-result filter (see _execute_tool) should already prevent the
+    model from ever seeing registry-metadata descriptions as if they were
+    real search results -- but confirmed in practice that a prompt/tool-
+    description change alone wasn't reliable enough on its own elsewhere
+    in this project, so this checks the actual output too. Checks
+    PER-SENTENCE (not whole-reply bag-of-words, which would false-positive
+    on any long legitimate answer sharing common tax vocabulary) for a
+    close paraphrase of one of our own registry description fields --
+    e.g. "Treasury.gov provides treasury guidance and rulings..." is a
+    near-verbatim rewrite of the seeded description, not a real answer."""
+    sentences = re.split(r"(?<=[.!?])\s+", reply)
+    for sentence in sentences:
+        sentence_words = set(sentence.lower().split())
+        for fragment in _REGISTRY_DESCRIPTION_FRAGMENTS:
+            fragment_words = set(fragment.split())
+            overlap = len(fragment_words & sentence_words) / len(fragment_words)
+            if overlap >= 0.7:
+                raise RuntimeError(f"LLM output appears to regurgitate a generic registry description rather than real content: {fragment!r}")
+
+
 def _validate_output_sources(reply: str, citations: list[dict]) -> None:
     """Output-side guardrail, symmetric to the input-side PII check: no
     matter what the LLM was told to do, verify what it actually produced.
@@ -335,12 +369,12 @@ _TOOL_DEFS = [
     },
     {
         "name": "search_internal_knowledge",
-        "description": "Search admin-curated internal tax documents (e.g. the OBBBA summary) for relevant guidance.",
+        "description": "ALWAYS TRY THIS FIRST for any question about a specific tax strategy, rule, or topic (e.g. 'Augusta Rule', 'home office deduction', 'QBI deduction', 'SEP-IRA'). Searches admin-curated, human-verified internal documents that cover many common strategies more reliably than a live web search. Only call search_official_sources if this returns nothing relevant.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
     },
     {
         "name": "search_official_sources",
-        "description": "Live discovery + real content extraction from ONLY the 7 approved government domains (irs.gov, treasury.gov, ssa.gov, cms.gov, dol.gov, pbgc.gov, sec.gov). Use for any question about a specific IRS rule, publication, or strategy not already covered by internal knowledge or a constant.",
+        "description": "Live discovery + real content extraction from ONLY the 7 approved government domains. Call search_internal_knowledge FIRST -- only use this if that returned nothing relevant. If this returns an empty results list, that means genuinely nothing specific was found -- say so honestly ('I don't have a verified answer for that') rather than describing what a domain generally covers.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -370,7 +404,18 @@ def _execute_tool(db: Session, user_id: str, conversation_id: str, tier: str, na
     if name == "search_internal_knowledge":
         return {"results": search_internal_knowledge(db, args["query"])}
     if name == "search_official_sources":
-        return {"results": search_official_sources(db, args.get("scope_tags", []), tier, query=args["query"])}
+        raw_results = search_official_sources(db, args.get("scope_tags", []), tier, query=args["query"])
+        # Filter registry_metadata entries out of what the MODEL sees, not
+        # just out of citations. Confirmed necessary in practice: the
+        # model was handed these generic domain descriptions as if they
+        # were real search results and wrote them up as an answer
+        # ("Treasury.gov provides treasury guidance and rulings...") --
+        # a near-verbatim paraphrase of our own registry description
+        # field, not an actual answer to the question. If nothing genuine
+        # was found, the model needs to see an EMPTY result, not a
+        # plausible-looking substitute it can't distinguish from a real one.
+        real_results = [r for r in raw_results if r.get("content_source") != "registry_metadata"]
+        return {"results": real_results, "note": "No specific guidance found for this query." if not real_results else None}
     if name == "create_professional_referral":
         create_professional_referral(db, user_id, conversation_id, args["reason"])
         return {"referred": True}
@@ -527,5 +572,6 @@ def run(db: Session, user_id: str, conversation_id: str, tier: str, plan, messag
             citations = [{"label": PLAN_DATA_LABEL}]
     _validate_output_sources(reply, citations)  # raises -> falls back to deterministic path if it fails
     _validate_tool_grounding(reply, any_tool_called)  # same fallback if a document name wasn't actually verified this turn
+    _validate_not_registry_regurgitation(reply)  # same fallback if the reply just paraphrases a generic domain description as if it were an answer
     _validate_numeric_grounding(reply, verified_numbers)  # same fallback if a stated dollar figure doesn't match any tool result
     return {"reply": reply, "citations": citations}
