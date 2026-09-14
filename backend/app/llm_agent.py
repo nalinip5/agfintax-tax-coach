@@ -89,7 +89,7 @@ def _plan_known_numbers(plan) -> set[float]:
     now that _validate_numeric_grounding no longer skips when no tool
     was called this turn."""
     numbers = set()
-    for value in (plan.agi, plan.magi, plan.confirmed_savings, plan.potential_savings):
+    for value in (plan.agi, plan.magi, plan.confirmed_savings, plan.potential_savings, plan.marginal_rate):
         if isinstance(value, (int, float)):
             numbers.add(float(value))
     for s in plan.strategies:

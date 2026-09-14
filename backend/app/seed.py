@@ -178,6 +178,62 @@ if not db.query(Document).filter(Document.title == "SEP-IRA Governing IRS Public
     db.flush()
     db.add(DocumentChunk(document_id=doc3.id, content=sep_ira_pubs_summary))
 
+# --- Home Office Deduction -- the exact question that returned garbage
+# navigation-menu content when live search's only candidate was a stale
+# newsroom press release, now correctly excluded by the authority-tier
+# fix. Seeding real content closes the resulting gap rather than leaving
+# it as an honest decline. ---
+if not db.query(Document).filter(Document.title == "Home Office Deduction (Simplified and Regular Methods)").first():
+    home_office_summary = (
+        "The home office deduction is available to self-employed individuals (sole proprietors, "
+        "independent contractors, partners) who use part of their home regularly and exclusively "
+        "for business. W-2 employees generally cannot claim it -- unreimbursed employee business "
+        "expenses remain suspended under current law.\n\n"
+        "Eligibility requirements:\n"
+        "- Exclusive use: the space must be used ONLY for business, not mixed with personal use.\n"
+        "- Regular use: used on a continuing basis, not occasionally.\n"
+        "- Must be either the principal place of business, a place to regularly meet clients or "
+        "customers, or a separate unattached structure used for business.\n\n"
+        "Two calculation methods:\n"
+        "- Simplified method: $5 per square foot of the home office, up to 300 square feet -- a "
+        "maximum deduction of $1,500. Reported directly on Schedule C without extra forms.\n"
+        "- Regular method: deduct the business-use percentage of actual home expenses (mortgage "
+        "interest, utilities, insurance, depreciation, repairs). Requires Form 8829 and generally "
+        "produces a larger deduction for those with high housing costs, at the cost of more "
+        "recordkeeping.\n\n"
+        "Either method requires the space to pass the exclusive-use and regular-use tests -- a "
+        "kitchen table used for both work and family meals would not qualify."
+    )
+    doc4 = Document(title="Home Office Deduction (Simplified and Regular Methods)", source_domain="irs.gov", published=True)
+    db.add(doc4)
+    db.flush()
+    db.add(DocumentChunk(document_id=doc4.id, content=home_office_summary))
+
+# --- QBI Deduction (Section 199A) -- seeded with the VERIFIED 2026
+# threshold specifically because an earlier live-search answer hallucinated
+# $214,900 when the actual figure is $201,775. Seeding the correct number
+# directly prevents that class of error from recurring on this topic. ---
+if not db.query(Document).filter(Document.title == "Qualified Business Income (QBI) Deduction (Section 199A)").first():
+    qbi_summary = (
+        "The Qualified Business Income (QBI) deduction under Internal Revenue Code Section 199A "
+        "allows eligible taxpayers to deduct up to 20% of qualified business income from "
+        "pass-through entities -- sole proprietorships, partnerships, and S corporations.\n\n"
+        "For 2026, the deduction begins phasing out above a taxable income of $201,775 (single "
+        "filers) or $403,500 (married filing jointly). Below these thresholds, eligible taxpayers "
+        "can generally claim the full 20% deduction regardless of business type or industry.\n\n"
+        "Above the threshold, two additional limitations apply:\n"
+        "- Specified service trades or businesses (SSTBs -- law, health, consulting, financial "
+        "services, and similar fields) see the deduction phase out entirely at higher income.\n"
+        "- For non-SSTB businesses above the threshold, the deduction is limited based on W-2 wages "
+        "paid by the business and the unadjusted basis of qualified property held.\n\n"
+        "The deduction also applies to 20% of qualified REIT dividends and publicly traded "
+        "partnership income, which are not subject to the wage/property limitations above."
+    )
+    doc5 = Document(title="Qualified Business Income (QBI) Deduction (Section 199A)", source_domain="irs.gov", published=True)
+    db.add(doc5)
+    db.flush()
+    db.add(DocumentChunk(document_id=doc5.id, content=qbi_summary))
+
 # --- PRD Section 5: the ONLY approved official sources. No other domain
 # may ever be added here -- see app/tools/knowledge.py's
 # APPROVED_SOURCE_DOMAINS, which is enforced independently of this seed. ---

@@ -181,6 +181,13 @@ check("InternalKB", "OBBBA has citation now (was missing before fix)", len(r["ci
 r = ask("What is the strategy for home sale deduction")
 check("InternalKB", "unrelated query correctly rejected (relevance floor)", "your plan on file" not in r["reply"] and "OBBBA" not in r["reply"])
 
+r = ask("What are the rules for a home office deduction?")
+check("InternalKB", "home office deduction has real content", "exclusive" in r["reply"].lower() and "simplified method" in r["reply"].lower())
+check("InternalKB", "REGRESSION: home office not misrouted to Augusta Rule (tie-break fix)", "Augusta" not in r["reply"])
+
+r = ask("How does the QBI deduction work for my income level?")
+check("InternalKB", "QBI uses CORRECT verified threshold, not the earlier hallucinated 214,900", "201,775" in r["reply"] and "214,900" not in r["reply"])
+
 # ============================================================
 # CATEGORY: Professional judgment / referral
 # ============================================================

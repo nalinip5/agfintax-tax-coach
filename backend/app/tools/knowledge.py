@@ -73,7 +73,7 @@ def _expand_term(term: str) -> list[str]:
     every variant a query term could reasonably match against."""
     lowered = term.lower()
     variants = {lowered}
-    for suffix in ("ing", "ed", "es", "s"):
+    for suffix in ("ing", "ed", "s"):
         if lowered.endswith(suffix) and len(lowered) - len(suffix) >= 3:
             variants.add(lowered[: -len(suffix)])
             break
@@ -97,7 +97,8 @@ def search_internal_knowledge(db: Session, query: str, limit: int = 5) -> list[d
     question. Every fact-bearing reply must trace to genuinely relevant
     source content, not a coincidental keyword collision.
     """
-    all_terms = [t for t in query.split() if len(t) > 2]
+    all_terms = [t.strip(".,?!:;\"'()") for t in query.split()]
+    all_terms = [t for t in all_terms if len(t) > 2]
     significant_terms = [t for t in all_terms if t.lower() not in _STOPWORDS]
     if not significant_terms:
         return []
@@ -114,9 +115,19 @@ def search_internal_knowledge(db: Session, query: str, limit: int = 5) -> list[d
     )
 
     def score(chunk: DocumentChunk) -> float:
+        # Content match is the base score; a title match on the same term
+        # adds a bonus -- a document specifically TITLED around a term is
+        # more likely the right match than one that merely mentions it in
+        # passing. Confirmed necessary in practice: "home office
+        # deduction rules" tied 0.75/0.75 between the correct "Home
+        # Office Deduction" document and an unrelated "Augusta Rule" one
+        # that happened to also mention "rules," "home," and "deduction"
+        # -- with no tie-breaker, insertion order picked the wrong one.
         text = chunk.content.lower()
-        matched = sum(1 for t, variants in term_variants.items() if any(v in text for v in variants))
-        return matched / len(significant_terms)
+        title = (chunk.document.title or "").lower()
+        content_matches = sum(1 for t, variants in term_variants.items() if any(v in text for v in variants))
+        title_matches = sum(1 for t, variants in term_variants.items() if any(v in title for v in variants))
+        return content_matches / len(significant_terms) + 0.1 * title_matches
 
     # Require at least half of the significant query terms to genuinely
     # appear in the chunk -- filters out documents that only coincidentally
@@ -198,6 +209,18 @@ def _tavily_discover(query: str, include_domains: list[str], max_results: int = 
         title = r.get("title", "")
         url = r.get("url", "")
         results.append({"domain": domain, "title": title, "url": url, "tavily_snippet": r.get("content", "")[:500], "authority_tier": _authority_tier(title, url)})
+    # Exclude tier-3 (press release / historical notice) results entirely,
+    # not just deprioritize them. Confirmed necessary in practice: a
+    # newsroom press release ("IRS reminds taxpayers of the home office
+    # deduction rules during Small Business Week") was the ONLY candidate
+    # returned, so sorting alone couldn't help -- it still got presented
+    # as the answer, and its actual extracted content turned out to be a
+    # navigation menu and language-switcher links, not substantive
+    # guidance. A stale press release is not useful guidance regardless
+    # of topical relevance -- better to return nothing here (triggering
+    # the honest "couldn't retrieve guidance" fallback) than to ever
+    # present one as if it answers the question.
+    results = [r for r in results if r["authority_tier"] < 3]
     results.sort(key=lambda r: r["authority_tier"])  # tier 1 (highest authority) first
     return results
 
